@@ -476,6 +476,11 @@ build the Debug variant of the Swift standard library and SDK overlay""",
         help="generate build directory only without building",
         action="store_true")
 
+    parser.add_argument("-v", "--verbose",
+        help="""
+output build commands as they are run""",
+        action="store_true")
+
     parser.add_argument("-i", "--ios",
         help="""
 also build for iOS, but disallow tests that require an iOS device""",
@@ -624,6 +629,12 @@ the number of parallel build jobs to use""",
             "--skip-test-optimized"
         ]
 
+
+    if args.verbose:
+        build_script_impl_inferred_args += [
+            "--verbose-build"
+        ]
+        
     if not args.ios:
         build_script_impl_inferred_args += [
             "--skip-build-ios",
