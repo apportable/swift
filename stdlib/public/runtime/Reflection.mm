@@ -261,6 +261,7 @@ static_assert(offsetof(MagicMirror, MirrorWitness) ==
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
   
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 AnyReturn swift_MagicMirrorData_value(HeapObject *owner,
                                       const OpaqueValue *value,
@@ -273,6 +274,7 @@ AnyReturn swift_MagicMirrorData_value(HeapObject *owner,
 
   return AnyReturn(result);
 }
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 const Metadata *swift_MagicMirrorData_valueType(HeapObject *owner,
                                                 const OpaqueValue *value,
@@ -281,6 +283,7 @@ const Metadata *swift_MagicMirrorData_valueType(HeapObject *owner,
 }
 
 #if SWIFT_OBJC_INTEROP
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 AnyReturn swift_MagicMirrorData_objcValue(HeapObject *owner,
                                           const OpaqueValue *value,
@@ -298,6 +301,40 @@ AnyReturn swift_MagicMirrorData_objcValue(HeapObject *owner,
 
 #pragma clang diagnostic pop
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
+extern "C"
+const char *swift_OpaqueSummary(const Metadata *T) {
+  switch (T->getKind()) {
+    case MetadataKind::Class:
+    case MetadataKind::Struct:
+    case MetadataKind::Enum:
+    case MetadataKind::Optional:
+    case MetadataKind::Metatype:
+      return nullptr;
+    case MetadataKind::Opaque:
+      return "(Opaque Value)";
+    case MetadataKind::Tuple:
+      return "(Tuple)";
+    case MetadataKind::Function:
+      return "(Function)";
+    case MetadataKind::Existential:
+      return "(Existential)";
+    case MetadataKind::ObjCClassWrapper:
+      return "(Objective-C Class Wrapper)";
+    case MetadataKind::ExistentialMetatype:
+      return "(Existential Metatype)";
+    case MetadataKind::ForeignClass:
+      return "(Foreign Class)";
+    case MetadataKind::HeapLocalVariable:
+      return "(Heap Local Variable)";
+    case MetadataKind::HeapGenericLocalVariable:
+      return "(Heap Generic Local Variable)";
+    case MetadataKind::ErrorObject:
+      return "(ErrorType Object)";
+  }
+}
+
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 void swift_MagicMirrorData_summary(const Metadata *T, String *result) {
   switch (T->getKind()) {
@@ -347,7 +384,7 @@ void swift_MagicMirrorData_summary(const Metadata *T, String *result) {
   }
 }
 
-  
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 const Metadata *swift_MagicMirrorData_objcValueType(HeapObject *owner,
                                                     const OpaqueValue *value,
@@ -359,6 +396,7 @@ const Metadata *swift_MagicMirrorData_objcValueType(HeapObject *owner,
   
 // -- Tuple destructuring.
   
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 intptr_t swift_TupleMirror_count(HeapObject *owner,
                                  const OpaqueValue *value,
@@ -465,6 +503,7 @@ static Mirror reflect(HeapObject *owner,
   
 /// \param owner passed at +1, consumed.
 /// \param value passed unowned.
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 StringMirrorTuple swift_TupleMirror_subscript(intptr_t i,
                                               HeapObject *owner,
@@ -511,6 +550,7 @@ static const char *getFieldName(const char *fieldNames, size_t i) {
 
 // -- Struct destructuring.
   
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 intptr_t swift_StructMirror_count(HeapObject *owner,
                                   const OpaqueValue *value,
@@ -519,6 +559,7 @@ intptr_t swift_StructMirror_count(HeapObject *owner,
   return Struct->Description->Struct.NumFields;
 }
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 StringMirrorTuple swift_StructMirror_subscript(intptr_t i,
                                                HeapObject *owner,
@@ -574,7 +615,12 @@ static void getEnumMirrorInfo(const OpaqueValue *value,
 
   unsigned payloadCases = Description.getNumPayloadCases();
 
-  unsigned tag = type->vw_getEnumTag(value);
+  // 'tag' is in the range [-ElementsWithPayload..ElementsWithNoPayload-1].
+  int tag = type->vw_getEnumTag(value);
+
+  // Convert resilient tag index to fragile tag index.
+  tag += payloadCases;
+
   const Metadata *payloadType = nullptr;
   bool indirect = false;
 
@@ -592,6 +638,7 @@ static void getEnumMirrorInfo(const OpaqueValue *value,
     *indirectPtr = indirect;
 }
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 const char *swift_EnumMirror_caseName(HeapObject *owner,
                                       const OpaqueValue *value,
@@ -607,6 +654,33 @@ const char *swift_EnumMirror_caseName(HeapObject *owner,
   return getFieldName(Description.CaseNames, tag);
 }
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
+extern "C"
+const char *swift_EnumCaseName(OpaqueValue *value, const Metadata *type) {
+  // Build a magic mirror. Unconditionally destroy the value at the end.
+  const _ReflectableWitnessTable *witness;
+  const Metadata *mirrorType;
+  const OpaqueValue *cMirrorValue;
+  std::tie(witness, mirrorType, cMirrorValue) = getReflectableConformance(type, value);
+  
+  OpaqueValue *mirrorValue = const_cast<OpaqueValue*>(cMirrorValue);
+  Mirror mirror;
+
+  if (witness) {
+    mirror = witness->getMirror(mirrorValue, mirrorType);
+  } else {
+    bool take = mirrorValue == value;
+    ::new (&mirror) MagicMirror(mirrorValue, mirrorType, take);
+  }
+
+  MagicMirror *theMirror = reinterpret_cast<MagicMirror *>(&mirror);
+  MagicMirrorData data = theMirror->Data;
+  const char *result = swift_EnumMirror_caseName(data.Owner, data.Value, data.Type);
+  type->vw_destroy(value);
+  return result;
+}
+
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 intptr_t swift_EnumMirror_count(HeapObject *owner,
                                 const OpaqueValue *value,
@@ -619,6 +693,7 @@ intptr_t swift_EnumMirror_count(HeapObject *owner,
   return (payloadType != nullptr) ? 1 : 0;
 }
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 StringMirrorTuple swift_EnumMirror_subscript(intptr_t i,
                                              HeapObject *owner,
@@ -664,6 +739,7 @@ static Mirror getMirrorForSuperclass(const ClassMetadata *sup,
                                      const OpaqueValue *value,
                                      const Metadata *type);
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 intptr_t swift_ClassMirror_count(HeapObject *owner,
                                  const OpaqueValue *value,
@@ -682,6 +758,7 @@ intptr_t swift_ClassMirror_count(HeapObject *owner,
 
 /// \param owner passed at +1, consumed.
 /// \param value passed unowned.
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 StringMirrorTuple swift_ClassMirror_subscript(intptr_t i,
                                               HeapObject *owner,
@@ -803,6 +880,7 @@ static const Metadata *getMetadataForEncoding(const char *encoding) {
 
 /// \param owner passed at +1, consumed.
 /// \param value passed unowned.
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 intptr_t swift_ObjCMirror_count(HeapObject *owner,
                                 const OpaqueValue *value,
@@ -838,6 +916,7 @@ static Mirror ObjC_getMirrorForSuperclass(Class sup,
                                           const OpaqueValue *value,
                                           const Metadata *type);
   
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 StringMirrorTuple swift_ObjCMirror_subscript(intptr_t i,
                                              HeapObject *owner,
@@ -901,6 +980,7 @@ StringMirrorTuple swift_ObjCMirror_subscript(intptr_t i,
 #endif
 }
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C" OptionalPlaygroundQuickLook
 swift_ClassMirror_quickLookObject(HeapObject *owner, const OpaqueValue *value,
                                   const Metadata *type) {
@@ -1257,6 +1337,7 @@ MirrorReturn swift::swift_reflectAny(OpaqueValue *value, const Metadata *T) {
 
 // NB: This function is not used directly in the Swift codebase, but is
 // exported for Xcode support. Please coordinate before changing.
+SWIFT_RUNTIME_EXPORT
 extern "C" void swift_stdlib_demangleName(const char *mangledName,
                                           size_t mangledNameLength,
                                           String *demangledName) {

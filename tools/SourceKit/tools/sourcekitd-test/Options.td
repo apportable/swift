@@ -63,3 +63,9 @@ def check_interface_is_ascii : Flag<["-"], "check-interface-ascii">,
 
 def json_request_path: Separate<["-"], "json-request-path">,
   HelpText<"path to read a request in JSON format">;
+
+def print_response_as_json : Flag<["-"], "print-response-as-json">,
+  HelpText<"Print the response as JSON output">;
+
+def group_name : Separate<["-"], "group-name">,
+  HelpText<"Module group name to print">;

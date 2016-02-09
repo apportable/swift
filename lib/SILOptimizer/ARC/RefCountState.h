@@ -18,6 +18,7 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
 #include <algorithm>
 
@@ -83,7 +84,7 @@ public:
     KnownSafe = false;
 
     // Initialize value.
-    RCRoot = I->getOperand(0).stripCasts();
+    RCRoot = stripCasts(I->getOperand(0));
 
     // Clear our insertion point list.
     InsertPts.clear();
@@ -135,7 +136,7 @@ public:
 
   /// Returns true if we have a valid value that we are tracking.
   bool hasRCRoot() const {
-    return RCRoot.isValid();
+    return (bool)RCRoot;
   }
 
   /// The latest point we can move the increment without bypassing instructions
@@ -337,7 +338,7 @@ public:
   /// Initialize the state given the consumed argument Arg.
   void initWithArg(SILArgument *Arg);
 
-  /// Initiailize this RefCountState with an instruction which introduces a new
+  /// Initialize this RefCountState with an instruction which introduces a new
   /// ref count at +1.
   void initWithEntranceInst(SILInstruction *I, SILValue RCIdentity);
 

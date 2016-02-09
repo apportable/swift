@@ -28,11 +28,11 @@ using ValueIDField = DeclIDField;
 
 using SILInstOpCodeField = BCFixed<8>;
 using SILTypeCategoryField = BCFixed<2>;
-using SILValueResultField = BCFixed<8>;
 
 enum SILStringEncoding : uint8_t {
   SIL_UTF8,
-  SIL_UTF16
+  SIL_UTF16,
+  SIL_OBJC_SELECTOR,
 };
 
 enum SILLinkageEncoding : uint8_t {
@@ -142,7 +142,7 @@ namespace sil_block {
     // We also share these layouts from the decls block. Their enumerators must
     // not overlap with ours.
     BOUND_GENERIC_SUBSTITUTION = decls_block::BOUND_GENERIC_SUBSTITUTION,
-    NO_CONFORMANCE = decls_block::NO_CONFORMANCE,
+    ABSTRACT_PROTOCOL_CONFORMANCE = decls_block::ABSTRACT_PROTOCOL_CONFORMANCE,
     NORMAL_PROTOCOL_CONFORMANCE = decls_block::NORMAL_PROTOCOL_CONFORMANCE,
     SPECIALIZED_PROTOCOL_CONFORMANCE
       = decls_block::SPECIALIZED_PROTOCOL_CONFORMANCE,
@@ -242,11 +242,9 @@ namespace sil_block {
     SILInstOpCodeField,
     BCFixed<2>,          // Optional attributes
     ValueIDField,
-    SILValueResultField,
     TypeIDField,
     SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
+    ValueIDField
   >;
 
   // SIL instructions with one type and one typed valueref.
@@ -258,8 +256,7 @@ namespace sil_block {
     SILTypeCategoryField,
     TypeIDField,
     SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
+    ValueIDField
   >;
 
   // SIL instructions that construct existential values.
@@ -271,7 +268,6 @@ namespace sil_block {
     TypeIDField,          // operand type
     SILTypeCategoryField, // operand type category
     ValueIDField,         // operand id
-    SILValueResultField,  // operand result id
     TypeIDField,          // formal concrete type
     BCVBR<5>              // # of protocol conformances
     // Trailed by protocol conformance info (if any)
@@ -286,8 +282,7 @@ namespace sil_block {
     SILTypeCategoryField,
     TypeIDField,
     SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
+    ValueIDField
   >;
 
   // SIL instructions with one type and a list of values.
@@ -314,7 +309,6 @@ namespace sil_block {
     TypeIDField,          // callee unsubstituted type
     TypeIDField,          // callee substituted type
     ValueIDField,         // callee value
-    SILValueResultField,
     BCArray<ValueIDField> // a list of arguments
   >;
 
@@ -333,8 +327,7 @@ namespace sil_block {
     BCFixed<3>,          // Optional attributes
     TypeIDField,
     SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
+    ValueIDField
   >;
 
   // SIL instructions with two typed values.
@@ -345,11 +338,9 @@ namespace sil_block {
     TypeIDField,
     SILTypeCategoryField,
     ValueIDField,
-    SILValueResultField,
     TypeIDField,
     SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
+    ValueIDField
   >;
 
   using SILGenericOuterParamsLayout = BCRecordLayout<

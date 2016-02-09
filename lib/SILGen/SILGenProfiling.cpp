@@ -514,7 +514,8 @@ public:
 
     } else if (auto *CS = dyn_cast<ContinueStmt>(S)) {
       // Continues create extra backedges, add them to the appropriate counters.
-      addToCounter(CS->getTarget(), getCurrentCounter());
+      if (!isa<RepeatWhileStmt>(CS->getTarget()))
+        addToCounter(CS->getTarget(), getCurrentCounter());
       if (auto *WS = dyn_cast<WhileStmt>(CS->getTarget())) {
         if (auto *E = getConditionNode(WS->getCond()))
           addToCounter(E, getCurrentCounter());
@@ -525,8 +526,12 @@ public:
 
     } else if (auto *BS = dyn_cast<BreakStmt>(S)) {
       // When we break from a loop, we need to adjust the exit count.
-      if (!isa<SwitchStmt>(BS->getTarget()))
+      if (auto *RWS = dyn_cast<RepeatWhileStmt>(BS->getTarget())) {
+        auto CondCount = CounterExpr::Sub(getCounter(RWS), getCurrentCounter());
+        addToCounter(RWS->getCond(), createCounter(std::move(CondCount)));
+      } else if (!isa<SwitchStmt>(BS->getTarget())) {
         addToCounter(BS->getTarget(), getCurrentCounter());
+      }
       terminateRegion(S);
 
     } else if (auto *FS = dyn_cast<FallthroughStmt>(S)) {
@@ -564,8 +569,11 @@ public:
       assignCounter(E);
     } else if (auto *IE = dyn_cast<IfExpr>(E)) {
       CounterExpr &ThenCounter = assignCounter(IE->getThenExpr());
-      assignCounter(IE->getElseExpr(),
-                    CounterExpr::Sub(getCurrentCounter(), ThenCounter));
+      if (Parent.isNull())
+        assignCounter(IE->getElseExpr());
+      else
+        assignCounter(IE->getElseExpr(),
+                      CounterExpr::Sub(getCurrentCounter(), ThenCounter));
     }
 
     if (hasCounter(E))

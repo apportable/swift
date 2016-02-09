@@ -7,16 +7,18 @@
 from __future__ import print_function
 
 import argparse
+import os
+import re
 import subprocess
 
 DEFAULT_TARGET_BASED_ON_SDK = {
-    'macosx'              : 'x86_64-apple-macosx10.11',
-    'iphoneos'            : 'arm64-apple-ios9.0',
-    'iphonesimulator'     : 'x86_64-apple-ios9.0',
-    'watchos'             : 'armv7k-apple-watchos2.0',
-    'watchos.simulator'   : 'i386-apple-watchos2.0',
-    'appletvos'           : 'arm64-apple-tvos9',
-    'appletvos.simulator' : 'x86_64-apple-tvos9',
+    'macosx': 'x86_64-apple-macosx10.11',
+    'iphoneos': 'arm64-apple-ios9.0',
+    'iphonesimulator': 'x86_64-apple-ios9.0',
+    'watchos': 'armv7k-apple-watchos2.0',
+    'watchos.simulator': 'i386-apple-watchos2.0',
+    'appletvos': 'arm64-apple-tvos9',
+    'appletvos.simulator': 'x86_64-apple-tvos9',
 }
 
 def create_parser():
@@ -28,11 +30,8 @@ def create_parser():
     parser.add_argument('-s', '--sdk', default='macosx', help="The SDK to use.")
     parser.add_argument('-t', '--target', help="The target triple to use.")
     parser.add_argument('-i', '--swift-ide-test', default='swift-ide-test', help="The swift-ide-test executable.")
-    parser.add_argument('-d', '--diff_tool', default='opendiff', help="The tool to use to diff the results.")
-    parser.add_argument('-b', '--only-before', action='store_true', help='Only emit the "before" result.')
-    parser.add_argument('--before-file', help='Emit "before" results to the given file [defaults to <modulename>.before.txt].')
-    parser.add_argument('-a', '--only-after', action='store_true', help='Only emit the "after" result.')
-    parser.add_argument('--after-file', help='Emit "after" results to the given file [defaults to <modulename>.after.txt].')
+    parser.add_argument('-3', '--swift-3', action='store_true', help="Use Swift 3 transformation")
+    parser.add_argument('-o', '--output-dir', default=os.getcwd(), help='Directory to which the output will be emitted.')
     parser.add_argument('-q', '--quiet', action='store_true', help='Suppress printing of status messages.')
     return parser
 
@@ -40,6 +39,74 @@ def output_command_result_to_file(command_args, filename):
     with open(filename, 'w') as output_file:
         subprocess.call(command_args, stdout=output_file)
 
+def run_command(args):
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate()
+    exitcode = proc.returncode
+    return (exitcode, out, err)
+
+# Collect the set of submodules for the given module.
+def collect_submodules(common_args, module):
+    # Execute swift-ide-test to print the interface.
+    my_args = ['-module-print-submodules', '-module-to-print=%s' % (module)]
+    (exitcode, out, err) = run_command(common_args + my_args)
+    if exitcode != 0:
+        print('error: submodule collection failed with error %d' % (exitcode))
+        return ()
+
+    # Find all of the submodule imports.
+    import_matcher = re.compile('.*import\s+%s\.([A-Za-z_0-9.]+)' % (module))
+    submodules = set()
+    for line in out.splitlines():
+        match = import_matcher.match(line)
+        if match:
+            submodules.add(match.group(1))
+
+    return sorted(list(submodules))
+
+# Dump the API for the given module.
+def dump_module_api(cmd, extra_dump_args, output_dir, module, quiet):
+    # Collect the submodules
+    submodules = collect_submodules(cmd, module)
+
+    # Dump the top-level module
+    subprocess.call(['mkdir', '-p', ('%s/%s' % (output_dir, module))])
+    output_file = '%s/%s/%s.swift' % (output_dir, module, module)
+    if not quiet:
+        print('Writing %s...' % output_file)
+
+    top_level_cmd = cmd + extra_dump_args + ['-module-to-print=%s' % (module)]
+    output_command_result_to_file(top_level_cmd, output_file)
+
+    # Dump each submodule.
+    for submodule in submodules:
+        output_file = '%s/%s/%s.swift' % (output_dir, module, submodule)
+        if not quiet:
+            print('Writing %s...' % output_file)
+
+        full_submodule = '%s.%s' % (module, submodule)
+        submodule_cmd = cmd + extra_dump_args
+        submodule_cmd = submodule_cmd + ['-module-to-print=%s' % (full_submodule)]
+        output_command_result_to_file(submodule_cmd, output_file)
+
+    return
+
+# Collect the set of frameworks we should dump 
+def collect_frameworks(sdk):
+    (exitcode, out, err) = run_command(["xcrun", "--show-sdk-path", "-sdk", sdk])
+    if exitcode != 0:
+        print('error: framework collection failed with error %d' % (exitcode))
+        return ()
+    sdk_path = out
+    
+    (exitcode, out, err) = run_command(["xcrun", "--show-sdk-version", "-sdk", sdk])
+    if exitcode != 0:
+        print('error: framework collection failed with error %d' % (exitcode))
+        return ()
+
+
+
+        
 def main():
     source_filename = 'omit-needless-words.swift'
     parser = create_parser()
@@ -52,38 +119,22 @@ def main():
     if not args.quiet:
         print('SDK Root = %s' % (sdkroot))
 
-    swift_ide_test_cmd = [args.swift_ide_test, '-print-module', '-source-filename', source_filename, '-sdk', sdkroot, '-target', args.target, '-module-print-skip-overlay', '-skip-unavailable', '-module-print-submodules', '-skip-imports', '-module-to-print=%s' % (args.module)]
-    omit_needless_words_args = ['-enable-omit-needless-words', '-enable-infer-default-arguments']
+    swift_ide_test_cmd_common = [args.swift_ide_test, '-print-module', '-source-filename', source_filename, '-sdk', sdkroot, '-target', args.target, '-module-print-skip-overlay', '-skip-unavailable', '-skip-print-doc-comments']
 
-    # Determine the output files.
-    # No good way with argparse to set default value based on dependency of other arg.
-    if not args.before_file:
-        args.before_file = '%s.before.txt' % (args.module)
-    if not args.after_file:
-        args.after_file = '%s.after.txt' % (args.module)
+    # Determine the set of extra arguments we'll use.
+    extra_args = ['-skip-imports']
+    if args.swift_3:
+        extra_args = extra_args + ['-enable-omit-needless-words', '-enable-infer-default-arguments', '-enable-strip-ns-prefix']
 
     # Create a .swift file we can feed into swift-ide-test
     subprocess.call(['touch', source_filename])
 
-    if not args.only_after:
-      # Print the interface without omitting needless words
-      if not args.quiet:
-          print('Writing %s...' % args.before_file)
-      output_command_result_to_file(swift_ide_test_cmd, args.before_file)
-
-    if not args.only_before:
-      # Print the interface omitting needless words
-      if not args.quiet:
-          print('Writing %s...' % args.after_file)
-      output_command_result_to_file(swift_ide_test_cmd + omit_needless_words_args, args.after_file)
+    # Dump the API for this module.
+    dump_module_api(swift_ide_test_cmd_common, extra_args, args.output_dir,
+                    args.module, args.quiet)
 
     # Remove the .swift file we fed into swift-ide-test
     subprocess.call(['rm', '-f', source_filename])
 
-    # Diff them
-    if args.diff_tool != "":
-        subprocess.call([args.diff_tool, args.before_file, args.after_file])
-
 if __name__ == '__main__':
     main()
-

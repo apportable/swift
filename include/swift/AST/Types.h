@@ -22,6 +22,7 @@
 #include "swift/AST/Ownership.h"
 #include "swift/AST/Requirement.h"
 #include "swift/AST/Type.h"
+#include "swift/AST/TypeAlignments.h"
 #include "swift/AST/Identifier.h"
 #include "swift/Basic/ArrayRefView.h"
 #include "swift/Basic/UUID.h"
@@ -31,6 +32,7 @@
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/TrailingObjects.h"
 
 namespace llvm {
   struct fltSemantics;
@@ -741,7 +743,7 @@ public:
   /// the context of the extension above will produce substitutions T
   /// -> Int and U -> String suitable for mapping the type of
   /// \c SomeArray.
-  TypeSubstitutionMap getMemberSubstitutions(DeclContext *dc);
+  TypeSubstitutionMap getMemberSubstitutions(const DeclContext *dc);
 
   /// Retrieve the type of the given member as seen through the given base
   /// type, substituting generic arguments where necessary.
@@ -779,7 +781,7 @@ public:
   /// substitute in the types from the given base type (this) to produce
   /// the resulting member type.
   Type getTypeOfMember(ModuleDecl *module, Type memberType,
-                       DeclContext *memberDC);
+                       const DeclContext *memberDC);
 
   /// Return T if this type is Optional<T>; otherwise, return the null type.
   Type getOptionalObjectType();
@@ -834,17 +836,6 @@ public:
 
   /// Retrieve the type declaration directly referenced by this type, if any.
   TypeDecl *getDirectlyReferencedTypeDecl() const;
-
-  /// Retrieve the default argument string that would be inferred for this type,
-  /// assuming that we know it is inferred.
-  ///
-  /// This routine pre-supposes that we know that the given type is the type of
-  /// a parameter that has a default, and all we need to figure out is which
-  /// default argument should be print.
-  ///
-  /// FIXME: This should go away when/if inferred default arguments become
-  /// "real".
-  StringRef getInferredDefaultArgString();
 
 private:
   // Make vanilla new/delete illegal for Types.
@@ -1253,9 +1244,11 @@ class TupleTypeElt {
   /// is variadic.
   llvm::PointerIntPair<Identifier, 1, bool> NameAndVariadic;
 
-  /// \brief This is the type of the field, which is mandatory, along with the
-  /// kind of default argument.
-  llvm::PointerIntPair<Type, 3, DefaultArgumentKind> TyAndDefaultArg;
+  /// \brief This is the type of the field.
+  Type ElementType;
+
+  /// The default argument,
+  DefaultArgumentKind DefaultArg;
 
   friend class TupleType;
 
@@ -1269,12 +1262,12 @@ public:
 
   /*implicit*/ TupleTypeElt(TypeBase *Ty)
     : NameAndVariadic(Identifier(), false),
-      TyAndDefaultArg(Ty, DefaultArgumentKind::None) { }
+      ElementType(Ty), DefaultArg(DefaultArgumentKind::None) { }
 
   bool hasName() const { return !NameAndVariadic.getPointer().empty(); }
   Identifier getName() const { return NameAndVariadic.getPointer(); }
 
-  Type getType() const { return TyAndDefaultArg.getPointer(); }
+  Type getType() const { return ElementType.getPointer(); }
 
   /// Determine whether this field is variadic.
   bool isVararg() const {
@@ -1282,9 +1275,7 @@ public:
   }
 
   /// Retrieve the kind of default argument available on this field.
-  DefaultArgumentKind getDefaultArgKind() const {
-    return TyAndDefaultArg.getInt();
-  }
+  DefaultArgumentKind getDefaultArgKind() const { return DefaultArg; }
 
   /// Whether we have a default argument.
   bool hasDefaultArg() const {
@@ -1935,7 +1926,7 @@ public:
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
-    return  T->getKind() == TypeKind::Module;
+    return T->getKind() == TypeKind::Module;
   }
   
 private:
@@ -2361,16 +2352,6 @@ public:
 
   GenericParamList &getGenericParams() const { return *Params; }
 
-  /// Substitute the given generic arguments into this polymorphic
-  /// function type and return the resulting non-polymorphic type.
-  FunctionType *substGenericArgs(ModuleDecl *M, ArrayRef<Type> args);
-
-  /// Substitute the given generic arguments into this polymorphic
-  /// function type and return the resulting non-polymorphic type.
-  ///
-  /// The order of Substitutions must match the order of generic archetypes.
-  FunctionType *substGenericArgs(ModuleDecl *M, ArrayRef<Substitution> subs);
-
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
     return T->getKind() == TypeKind::PolymorphicFunction;
@@ -2713,16 +2694,6 @@ public:
     return getWithType(fn(getType()));
   }
 
-  /// Replace references to substitutable types with new, concrete types and
-  /// return the substituted result.
-  ///
-  /// The API is comparable to Type::subst.
-  SILParameterInfo subst(ModuleDecl *module, TypeSubstitutionMap &substitutions,
-                         SubstOptions options) const {
-    Type type = getType().subst(module, substitutions, options);
-    return getWithType(type->getCanonicalType());
-  }
-
   void profile(llvm::FoldingSetNodeID &id) {
     id.AddPointer(Ty.getPointer());
     id.AddInteger((unsigned)Convention);
@@ -2809,16 +2780,6 @@ public:
     return getWithType(fn(getType()));
   }
 
-  /// Replace references to substitutable types with new, concrete types and
-  /// return the substituted result.
-  ///
-  /// The API is comparable to Type::subst.
-  SILResultInfo subst(ModuleDecl *module, TypeSubstitutionMap &substitutions,
-                      SubstOptions options) const {
-    Type type = getType().subst(module, substitutions, options);
-    return getWithType(type->getCanonicalType());
-  }
-
   void profile(llvm::FoldingSetNodeID &id) {
     id.AddPointer(TypeAndConvention.getOpaqueValue());
   }
@@ -2844,27 +2805,25 @@ public:
 class SILFunctionType;
 typedef CanTypeWrapper<SILFunctionType> CanSILFunctionType;
 
-// Some macros to aid the SILFunctionType transition.
-#if 0
-# define SIL_FUNCTION_TYPE_DEPRECATED __attribute__((deprecated))
-# define SIL_FUNCTION_TYPE_IGNORE_DEPRECATED_BEGIN \
-    _Pragma("clang diagnostic push") \
-    _Pragma("clang diagnostic ignored \"-Wdeprecated\"")
-# define SIL_FUNCTION_TYPE_IGNORE_DEPRECATED_END \
-    _Pragma("clang diagnostic pop")
-#else
-# define SIL_FUNCTION_TYPE_DEPRECATED
-# define SIL_FUNCTION_TYPE_IGNORE_DEPRECATED_BEGIN
-# define SIL_FUNCTION_TYPE_IGNORE_DEPRECATED_END
-#endif
-  
-/// SILFunctionType - The detailed type of a function value, suitable
+/// SILFunctionType - The lowered type of a function value, suitable
 /// for use by SIL.
 ///
 /// This type is defined by the AST library because it must be capable
 /// of appearing in secondary positions, e.g. within tuple and
 /// function parameter and result types.
-class SILFunctionType : public TypeBase, public llvm::FoldingSetNode {
+class SILFunctionType final : public TypeBase, public llvm::FoldingSetNode,
+    private llvm::TrailingObjects<SILFunctionType, SILParameterInfo,
+                                  SILResultInfo> {
+  friend TrailingObjects;
+
+  size_t numTrailingObjects(OverloadToken<SILParameterInfo>) const {
+    return NumParameters;
+  }
+
+  size_t numTrailingObjects(OverloadToken<SILResultInfo>) const {
+    return hasErrorResult() ? 1 : 0;
+  }
+
 public:
   using Language = SILFunctionLanguage;
   using Representation = SILFunctionTypeRepresentation;
@@ -2983,13 +2942,12 @@ private:
   SILResultInfo InterfaceResult;
 
   MutableArrayRef<SILParameterInfo> getMutableParameters() {
-    auto ptr = reinterpret_cast<SILParameterInfo*>(this + 1);
-    return MutableArrayRef<SILParameterInfo>(ptr, NumParameters);
+    return {getTrailingObjects<SILParameterInfo>(), NumParameters};
   }
 
   SILResultInfo &getMutableErrorResult() {
     assert(hasErrorResult());
-    return *reinterpret_cast<SILResultInfo*>(getMutableParameters().end());
+    return *getTrailingObjects<SILResultInfo>();
   }
 
   SILFunctionType(GenericSignature *genericSig, ExtInfo ext,
@@ -3193,7 +3151,7 @@ DEFINE_EMPTY_CAN_TYPE_WRAPPER(SILBlockStorageType, Type)
 
 /// A type with a special syntax that is always sugar for a library type.
 ///
-/// The prime examples are arrays (T[] -> Array<T>) and
+/// The prime examples are arrays ([T] -> Array<T>) and
 /// optionals (T? -> Optional<T>).
 class SyntaxSugarType : public TypeBase {
   Type Base;
@@ -3529,7 +3487,10 @@ DEFINE_EMPTY_CAN_TYPE_WRAPPER(SubstitutableType, Type)
 /// Archetypes are used to represent generic type parameters and their
 /// associated types, as well as the runtime type stored within an
 /// existential container.
-class ArchetypeType : public SubstitutableType {
+class ArchetypeType final : public SubstitutableType,
+    private llvm::TrailingObjects<ArchetypeType, UUID> {
+  friend TrailingObjects;
+
 public:
   typedef llvm::PointerUnion<AssociatedTypeDecl *, ProtocolDecl *>
     AssocTypeOrProtocolType;
@@ -3589,7 +3550,7 @@ private:
   void setOpenedExistentialID(UUID value) {
     assert(getOpenedExistentialType() && "Not an opened existential archetype");
     // The UUID is tail-allocated at the end of opened existential archetypes.
-    *reinterpret_cast<UUID *>(this + 1) = value;
+    *getTrailingObjects<UUID>() = value;
   }
 
   void resolveNestedType(std::pair<Identifier, NestedType> &nested) const;
@@ -3737,18 +3698,13 @@ public:
   UUID getOpenedExistentialID() const {
     assert(getOpenedExistentialType() && "Not an opened existential archetype");
     // The UUID is tail-allocated at the end of opened existential archetypes.
-    return *reinterpret_cast<const UUID *>(this + 1);
+    return *getTrailingObjects<UUID>();
   }
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
     return T->getKind() == TypeKind::Archetype;
   }
-  
-  /// Convert an archetype to a dependent generic parameter type using the
-  /// given mapping of primary archetypes to generic parameter types.
-  Type getAsDependentType(
-                    const llvm::DenseMap<ArchetypeType *, Type> &archetypeMap);
   
   /// getIsRecursive - The archetype type refers back to itself.
   bool getIsRecursive() { return this->isRecursive; }
@@ -4118,6 +4074,9 @@ END_CAN_TYPE_WRAPPER(WeakStorageType, ReferenceStorageType)
 
 /// \brief A type variable used during type checking.
 class TypeVariableType : public TypeBase {
+  // Note: We can't use llvm::TrailingObjects here because the trailing object
+  // type is opaque.
+
   TypeVariableType(const ASTContext &C, unsigned ID)
     : TypeBase(TypeKind::TypeVariable, &C,
                RecursiveTypeProperties::HasTypeVariable) {
@@ -4127,12 +4086,7 @@ class TypeVariableType : public TypeBase {
   class Implementation;
   
 public:
-  
-  /// \brief Printing substitutions for type variables may result in recursive
-  /// references to the type variable itself. This flag is used to short-circuit
-  /// such operations.
-  bool isPrinting = false;
-  
+ 
   /// \brief Create a new type variable whose implementation is constructed
   /// with the given arguments.
   template<typename ...Args>
@@ -4366,7 +4320,7 @@ inline TupleTypeElt::TupleTypeElt(Type ty,
                                   DefaultArgumentKind defArg,
                                   bool isVariadic)
   : NameAndVariadic(name, isVariadic),
-    TyAndDefaultArg(ty.getPointer(), defArg)
+    ElementType(ty), DefaultArg(defArg)
 {
   assert(!isVariadic ||
          isa<ErrorType>(ty.getPointer()) ||

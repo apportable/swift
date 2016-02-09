@@ -28,6 +28,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/TrailingObjects.h"
 #include "clang/Basic/VersionTuple.h"
 
 namespace swift {
@@ -760,7 +761,10 @@ public:
 };
 
 /// Indicates that the given declaration is visible to Objective-C.
-class ObjCAttr : public DeclAttribute {
+class ObjCAttr final : public DeclAttribute,
+    private llvm::TrailingObjects<ObjCAttr, SourceLoc> {
+  friend TrailingObjects;
+
   /// The Objective-C name associated with this entity, stored in its opaque
   /// representation so that we can use null as an indicator for "no name".
   void *NameData;
@@ -793,7 +797,7 @@ class ObjCAttr : public DeclAttribute {
     unsigned length = 2;
     if (auto name = getName())
       length += name->getNumSelectorPieces();
-    return { reinterpret_cast<SourceLoc *>(this + 1), length };
+    return {getTrailingObjects<SourceLoc>(), length};
   }
 
   /// Retrieve the trailing location information.
@@ -802,7 +806,7 @@ class ObjCAttr : public DeclAttribute {
     unsigned length = 2;
     if (auto name = getName())
       length += name->getNumSelectorPieces();
-    return { reinterpret_cast<const SourceLoc *>(this + 1), length };
+    return {getTrailingObjects<SourceLoc>(), length};
   }
 
 public:
@@ -1150,28 +1154,25 @@ public:
   }
 };
 
-/// The internal @_migration_id attribute, which is used to keep track of stdlib
-/// changes for migration purposes.
-class MigrationIdAttr : public DeclAttribute {
-  StringRef Ident;
-  StringRef PatternId;
+/// The @swift3_migration attribute which describes the transformations
+/// required to migrate the given Swift 2.x API to Swift 3.
+class Swift3MigrationAttr : public DeclAttribute {
+  DeclName Renamed;
+  StringRef Message;
 
 public:
-  MigrationIdAttr(SourceLoc atLoc, SourceLoc attrLoc, SourceLoc lParenLoc,
-                  StringRef ident, StringRef patternId,
-                  SourceLoc rParenLoc, bool implicit)
-    : DeclAttribute(DAK_MigrationId, attrLoc,
-                    SourceRange(atLoc, rParenLoc), implicit),
-      Ident(ident), PatternId(patternId) {}
+  Swift3MigrationAttr(SourceLoc atLoc, SourceLoc attrLoc, SourceLoc lParenLoc,
+                      DeclName renamed, StringRef message, SourceLoc rParenLoc,
+                      bool implicit)
+    : DeclAttribute(DAK_Swift3Migration, atLoc, SourceRange(attrLoc, rParenLoc),
+                    implicit),
+      Renamed(renamed), Message(message) { }
 
-  /// Retrieve the migration identifier associated with the symbol.
-  StringRef getIdent() const { return Ident; }
-
-  /// Retrieve pattern identifier associated with the symbol.
-  StringRef getPatternId() const { return PatternId; }
+  DeclName getRenamed() const { return Renamed; }
+  StringRef getMessage() const { return Message; }
 
   static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_MigrationId;
+    return DA->getKind() == DAK_Swift3Migration;
   }
 };
 

@@ -144,7 +144,7 @@ static void addDereferenceableAttributeToBuilder(IRGenModule &IGM,
                                                  const TypeInfo &ti) {
   // The addresses of empty values are undefined, so we can't safely mark them
   // dereferenceable.
-  if (ti.isKnownEmpty())
+  if (ti.isKnownEmpty(ResilienceExpansion::Maximal))
     return;
   
   // If we know the type to have a fixed nonempty size, then the pointer is
@@ -266,40 +266,9 @@ namespace {
     CallResult() : CurState(State::Invalid) {}
     ~CallResult() { reset(); }
 
-    /// Configure this result to carry a number of direct values at
-    /// the given explosion level.
-    Explosion &initForDirectValues() {
-      assert(CurState == State::Invalid);
-      CurState = State::Direct;
-      return *new (&CurValue.Direct) Explosion();
-    }
-
-    /// As a potential efficiency, set that this is a direct result
-    /// with no values.
-    void setAsEmptyDirect() {
-      initForDirectValues();
-    }
-
-    /// Set this result so that it carries a single directly-returned
-    /// maximally-fragile value without management.
-    void setAsSingleDirectUnmanagedFragileValue(llvm::Value *value) {
-      initForDirectValues().add(value);
-    }
-
-    void setAsIndirectAddress(Address address) {
-      assert(CurState == State::Invalid);
-      CurState = State::Indirect;
-      CurValue.Indirect = address;
-    }
-
     bool isInvalid() const { return CurState == State::Invalid; } 
     bool isDirect() const { return CurState == State::Direct; }
     bool isIndirect() const { return CurState == State::Indirect; }
-
-    Explosion &getDirectValues() {
-      assert(isDirect());
-      return CurValue.Direct;
-    }
 
     Address getIndirectAddress() const {
       assert(isIndirect());
@@ -724,8 +693,8 @@ const TypeInfo *TypeConverter::convertBlockStorageType(SILBlockStorageType *T) {
     spareBits.extendWithSetBits(captureOffset.getValueInBits());
     size = captureOffset + fixedCapture->getFixedSize();
     spareBits.append(fixedCapture->getSpareBits());
-    pod = fixedCapture->isPOD(ResilienceScope::Component);
-    bt = fixedCapture->isBitwiseTakable(ResilienceScope::Component);
+    pod = fixedCapture->isPOD(ResilienceExpansion::Maximal);
+    bt = fixedCapture->isBitwiseTakable(ResilienceExpansion::Maximal);
   }
   
   llvm::Type *storageElts[] = {
@@ -944,6 +913,9 @@ namespace {
       case clang::Type::MemberPointer:
       case clang::Type::Auto:
         llvm_unreachable("C++ type in ABI lowering?");
+
+      case clang::Type::Pipe:
+        llvm_unreachable("OpenCL type in ABI lowering?");
 
       case clang::Type::ConstantArray: {
         auto array = Ctx.getAsConstantArrayType(type);
@@ -3446,6 +3418,24 @@ static llvm::Function *emitPartialApplicationForwarder(IRGenModule &IGM,
     assert(contextPtr->getType() == IGM.RefCountedPtrTy);
   }
 
+  Explosion polyArgs;
+
+  // Emit the polymorphic arguments.
+  assert((subs.empty() != hasPolymorphicParameters(origType) ||
+         (subs.empty() && origType->getRepresentation() ==
+             SILFunctionTypeRepresentation::WitnessMethod))
+         && "should have substitutions iff original function is generic");
+  WitnessMetadata witnessMetadata;
+  if (hasPolymorphicParameters(origType)) {
+    emitPolymorphicArguments(subIGF, origType, substType, subs,
+                             &witnessMetadata, polyArgs);
+  }
+
+  auto haveContextArgument =
+      calleeHasContext ||
+      (origType->hasSelfParam() &&
+       isSelfContextParameter(origType->getSelfParameter()));
+
   // If there's a data pointer required, but it's a swift-retainable
   // value being passed as the context, just forward it down.
   if (!layout) {
@@ -3484,8 +3474,21 @@ static llvm::Function *emitPartialApplicationForwarder(IRGenModule &IGM,
       llvm_unreachable("should never happen!");
     }
 
+    // FIXME: The naming and documentation here isn't ideal. This
+    // parameter is always present which is evident since we always
+    // grab a type to cast to, but sometimes after the polymorphic
+    // arguments. This is just following the lead of existing (and not
+    // terribly easy to follow) code.
+
+    // If there is a context argument, it comes after the polymorphic
+    // arguments.
+    auto argIndex = args.size();
+    if (haveContextArgument)
+      argIndex += polyArgs.size();
+
     llvm::Type *expectedArgTy =
-      fnTy->getPointerElementType()->getFunctionParamType(args.size());
+        fnTy->getPointerElementType()->getFunctionParamType(argIndex);
+
     llvm::Value *argValue;
     if (isIndirectParameter(argConvention)) {
       expectedArgTy = expectedArgTy->getPointerElementType();
@@ -3553,7 +3556,7 @@ static llvm::Function *emitPartialApplicationForwarder(IRGenModule &IGM,
       case ParameterConvention::Direct_Unowned:
         // If the type is nontrivial, keep the context alive since the field
         // depends on the context to not be deallocated.
-        if (!fieldTI.isPOD(ResilienceScope::Component))
+        if (!fieldTI.isPOD(ResilienceExpansion::Maximal))
           dependsOnContextLifetime = true;
         SWIFT_FALLTHROUGH;
       case ParameterConvention::Direct_Deallocating:
@@ -3624,22 +3627,10 @@ static llvm::Function *emitPartialApplicationForwarder(IRGenModule &IGM,
   //   - 'self', in which case it was the last formal argument.
   // In either case, it's the last thing in 'args'.
   llvm::Value *fnContext = nullptr;
-  if (calleeHasContext ||
-      (origType->hasSelfParam() &&
-       isSelfContextParameter(origType->getSelfParameter()))) {
+  if (haveContextArgument)
     fnContext = args.takeLast();
-  }
 
-  // Emit the polymorphic arguments.
-  assert((subs.empty() != hasPolymorphicParameters(origType) ||
-         (subs.empty() && origType->getRepresentation() ==
-             SILFunctionTypeRepresentation::WitnessMethod))
-         && "should have substitutions iff original function is generic");
-  WitnessMetadata witnessMetadata;
-  if (hasPolymorphicParameters(origType)) {
-    emitPolymorphicArguments(subIGF, origType, substType, subs,
-                             &witnessMetadata, args);
-  }
+  polyArgs.transferInto(args, polyArgs.size());
 
   // Okay, this is where the callee context goes.
   if (fnContext) {
@@ -3797,7 +3788,7 @@ void irgen::emitFunctionPartialApplication(IRGenFunction &IGF,
       continue;
     }
       
-    if (ti.isSingleSwiftRetainablePointer(ResilienceScope::Component)) {
+    if (ti.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
       hasSingleSwiftRefcountedContext = Yes;
       singleRefcountedConvention = param.getConvention();
     } else {
@@ -4071,7 +4062,7 @@ void irgen::emitBlockHeader(IRGenFunction &IGF,
   uint32_t flags = 0;
   auto &captureTL
     = IGF.getTypeInfoForLowered(blockTy->getCaptureType());
-  bool isPOD = captureTL.isPOD(ResilienceScope::Component);
+  bool isPOD = captureTL.isPOD(ResilienceExpansion::Maximal);
   if (!isPOD)
     flags |= 1 << 25;
   

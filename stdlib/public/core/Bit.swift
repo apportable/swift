@@ -16,7 +16,7 @@
 
 /// A `RandomAccessIndexType` that has two possible values.  Used as
 /// the `Index` type for `CollectionOfOne<T>`.
-public enum Bit : Int, Comparable, RandomAccessIndexType, _Reflectable {
+public enum Bit : Int, Comparable, RandomAccessIndexType {
 
   public typealias Distance = Int
 
@@ -45,42 +45,6 @@ public enum Bit : Int, Comparable, RandomAccessIndexType, _Reflectable {
   public func advancedBy(n: Distance) -> Bit {
     return rawValue.advancedBy(n) > 0 ? One : Zero
   }
-
-  /// Returns a mirror that reflects `self`.
-  public func _getMirror() -> _MirrorType {
-    return _BitMirror(self)
-  }
-}
-
-internal struct _BitMirror : _MirrorType {
-  let _value: Bit
-
-  init(_ v: Bit) {
-    self._value = v
-  }
-
-  var value: Any { return _value }
-
-  var valueType: Any.Type { return (_value as Any).dynamicType }
-
-  var objectIdentifier: ObjectIdentifier? { return nil }
-
-  var count: Int { return 0 }
-
-  subscript(i: Int) -> (String, _MirrorType) {
-    _preconditionFailure("_MirrorType access out of bounds")
-  }
-
-  var summary: String {
-    switch _value {
-      case .Zero: return ".Zero"
-      case .One:  return ".One"
-    }
-  }
-
-  var quickLookObject: PlaygroundQuickLook? { return nil }
-
-  var disposition: _MirrorDisposition { return .Enum }
 }
 
 @warn_unused_result
@@ -94,16 +58,15 @@ public func < (lhs: Bit, rhs: Bit) -> Bool {
 }
 
 extension Bit : IntegerArithmeticType {
-  static func _withOverflow(
-    intResult: Int, overflow: Bool
+  static func _withOverflow(value : (intResult: Int, overflow: Bool)
   ) -> (Bit, overflow: Bool) {
-    if let bit = Bit(rawValue: intResult) {
-      return (bit, overflow: overflow)
-    } else {
-      let bitRaw = intResult % 2 + (intResult < 0 ? 2 : 0)
-      let bit = Bit(rawValue: bitRaw)!
-      return (bit, overflow: true)
+    if let bit = Bit(rawValue: value.intResult) {
+      return (bit, overflow: value.overflow)
     }
+
+    let bitRaw = value.intResult % 2 + (value.intResult < 0 ? 2 : 0)
+    let bit = Bit(rawValue: bitRaw)!
+    return (bit, overflow: true)
   }
 
   /// Add `lhs` and `rhs`, returning a result and a `Bool` that is

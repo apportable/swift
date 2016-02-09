@@ -17,14 +17,12 @@
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/Parse/Parser.h"
 #include "swift/Serialization/BCReadingExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace swift;
 using namespace swift::serialization;
-
-using ConformancePair = std::pair<ProtocolDecl *, ProtocolConformance *>;
-
 
 namespace {
   struct IDAndKind {
@@ -270,6 +268,12 @@ getActualDefaultArgKind(uint8_t raw) {
     return swift::DefaultArgumentKind::Function;
   case serialization::DefaultArgumentKind::DSOHandle:
     return swift::DefaultArgumentKind::DSOHandle;
+  case serialization::DefaultArgumentKind::Nil:
+    return swift::DefaultArgumentKind::Nil;
+  case serialization::DefaultArgumentKind::EmptyArray:
+    return swift::DefaultArgumentKind::EmptyArray;
+  case serialization::DefaultArgumentKind::EmptyDictionary:
+    return swift::DefaultArgumentKind::EmptyDictionary;
   }
   return None;
 }
@@ -427,7 +431,7 @@ Pattern *ModuleFile::maybeReadPattern() {
   }
 }
 
-ProtocolConformance *ModuleFile::readConformance(llvm::BitstreamCursor &Cursor){
+ProtocolConformanceRef ModuleFile::readConformance(llvm::BitstreamCursor &Cursor){
   using namespace decls_block;
 
   SmallVector<uint64_t, 16> scratch;
@@ -437,9 +441,11 @@ ProtocolConformance *ModuleFile::readConformance(llvm::BitstreamCursor &Cursor){
 
   unsigned kind = Cursor.readRecord(next.ID, scratch);
   switch (kind) {
-  case NO_CONFORMANCE: {
-    // Nothing to read.
-    return nullptr;
+  case ABSTRACT_PROTOCOL_CONFORMANCE: {
+    DeclID protoID;
+    AbstractProtocolConformanceLayout::readRecord(scratch, protoID);
+    auto proto = cast<ProtocolDecl>(getDecl(protoID));
+    return ProtocolConformanceRef(proto);
   }
 
   case SPECIALIZED_PROTOCOL_CONFORMANCE: {
@@ -459,11 +465,14 @@ ProtocolConformance *ModuleFile::readConformance(llvm::BitstreamCursor &Cursor){
       substitutions.push_back(*sub);
     }
 
-    ProtocolConformance *genericConformance = readConformance(Cursor);
+    ProtocolConformanceRef genericConformance = readConformance(Cursor);
 
-    assert(genericConformance && "Missing generic conformance?");
-    return ctx.getSpecializedConformance(conformingType, genericConformance,
+    assert(genericConformance.isConcrete() && "Abstract generic conformance?");
+    auto conformance =
+           ctx.getSpecializedConformance(conformingType,
+                                         genericConformance.getConcrete(),
                                          ctx.AllocateCopy(substitutions));
+    return ProtocolConformanceRef(conformance);
   }
 
   case INHERITED_PROTOCOL_CONFORMANCE: {
@@ -473,16 +482,20 @@ ProtocolConformance *ModuleFile::readConformance(llvm::BitstreamCursor &Cursor){
     ASTContext &ctx = getContext();
     Type conformingType = getType(conformingTypeID);
 
-    ProtocolConformance *inheritedConformance = readConformance(Cursor);
+    ProtocolConformanceRef inheritedConformance = readConformance(Cursor);
 
-    assert(inheritedConformance && "Missing generic conformance?");
-    return ctx.getInheritedConformance(conformingType, inheritedConformance);
+    assert(inheritedConformance.isConcrete() &&
+           "Abstract inherited conformance?");
+    auto conformance =
+      ctx.getInheritedConformance(conformingType,
+                                  inheritedConformance.getConcrete());
+    return ProtocolConformanceRef(conformance);
   }
 
   case NORMAL_PROTOCOL_CONFORMANCE_ID: {
     NormalConformanceID conformanceID;
     NormalProtocolConformanceIdLayout::readRecord(scratch, conformanceID);
-    return readNormalConformance(conformanceID);
+    return ProtocolConformanceRef(readNormalConformance(conformanceID));
   }
 
   case PROTOCOL_CONFORMANCE_XREF: {
@@ -500,13 +513,14 @@ ProtocolConformance *ModuleFile::readConformance(llvm::BitstreamCursor &Cursor){
     nominal->lookupConformance(module, proto,
                                conformances);
     assert(!conformances.empty() && "Could not find conformance");
-    return conformances.front();
+    return ProtocolConformanceRef(conformances.front());
   }
 
   // Not a protocol conformance.
   default:
     error();
-    return nullptr;
+    ProtocolConformance *conformance = nullptr;
+    return ProtocolConformanceRef(conformance); // FIXME: this will assert
   }
 }
 
@@ -565,8 +579,9 @@ NormalProtocolConformance *ModuleFile::readNormalConformance(
   // Read inherited conformances.
   InheritedConformanceMap inheritedConformances;
   while (inheritedCount--) {
-    auto inherited = readConformance(DeclTypeCursor);
-    assert(inherited);
+    auto inheritedRef = readConformance(DeclTypeCursor);
+    assert(inheritedRef.isConcrete());
+    auto inherited = inheritedRef.getConcrete();
     inheritedConformances[inherited->getProtocol()] = inherited;
   }
 
@@ -598,28 +613,21 @@ ModuleFile::maybeReadSubstitution(llvm::BitstreamCursor &cursor) {
   if (recordID != decls_block::BOUND_GENERIC_SUBSTITUTION)
     return None;
 
-  TypeID archetypeID, replacementID;
+  TypeID replacementID;
   unsigned numConformances;
   decls_block::BoundGenericSubstitutionLayout::readRecord(scratch,
-                                                          archetypeID,
                                                           replacementID,
                                                           numConformances);
 
-  if (&cursor == &SILCursor) {
-    assert(Types[archetypeID-1].isComplete() &&
-	   "SIL substitutions should always reference existing archetypes");
-  }
-
-  auto archetypeTy = getType(archetypeID)->castTo<ArchetypeType>();
   auto replacementTy = getType(replacementID);
 
-  SmallVector<ProtocolConformance *, 4> conformanceBuf;
+  SmallVector<ProtocolConformanceRef, 4> conformanceBuf;
   while (numConformances--) {
     conformanceBuf.push_back(readConformance(cursor));
   }
 
   lastRecordOffset.reset();
-  return Substitution{archetypeTy, replacementTy,
+  return Substitution{replacementTy,
                       getContext().AllocateCopy(conformanceBuf)};
 }
 
@@ -759,7 +767,7 @@ GenericParamList *ModuleFile::maybeReadGenericParams(DeclContext *DC,
         auto subject = TypeLoc::withoutLoc(getType(rawTypeIDs[0]));
         auto constraint = TypeLoc::withoutLoc(getType(rawTypeIDs[1]));
 
-        requirements.push_back(RequirementRepr::getConformance(subject,
+        requirements.push_back(RequirementRepr::getTypeConstraint(subject,
                                                            SourceLoc(),
                                                            constraint));
         break;
@@ -774,6 +782,7 @@ GenericParamList *ModuleFile::maybeReadGenericParams(DeclContext *DC,
         break;
       }
 
+      case GenericRequirementKind::Superclass:
       case WitnessMarker: {
         // Shouldn't happen where we have requirement representations.
         error();
@@ -853,6 +862,14 @@ void ModuleFile::readGenericRequirements(
         auto constraint = getType(rawTypeIDs[1]);
 
         requirements.push_back(Requirement(RequirementKind::Conformance,
+                                           subject, constraint));
+        break;
+      }
+      case GenericRequirementKind::Superclass: {
+        auto subject = getType(rawTypeIDs[0]);
+        auto constraint = getType(rawTypeIDs[1]);
+
+        requirements.push_back(Requirement(RequirementKind::Superclass,
                                            subject, constraint));
         break;
       }
@@ -1031,11 +1048,48 @@ Decl *ModuleFile::resolveCrossReference(Module *M, uint32_t pathLen) {
     if (!isType)
       pathTrace.addType(filterTy);
 
+    bool retrying = false;
+    retry:
+
     M->lookupQualified(ModuleType::get(M), name,
                        NL_QualifiedDefault | NL_KnownNoDependency,
                        /*typeResolver=*/nullptr, values);
     filterValues(filterTy, nullptr, nullptr, isType, inProtocolExt, None,
                  values);
+
+    // HACK HACK HACK: Omit-needless-words hack to try to cope with
+    // the "NS" prefix being added/removed. No "real" compiler mode
+    // has to go through this path: a Swift 2 compiler will have the
+    // prefix, while a Swift 3 compiler will not have the
+    // prefix. However, one can set OmitNeedlessWords in a Swift 2
+    // compiler to get API dumps and perform basic testing; this hack
+    // keeps that working.
+    if (values.empty() && !retrying &&
+        getContext().LangOpts.OmitNeedlessWords &&
+        getContext().LangOpts.StripNSPrefix &&
+        (M->getName().str() == "ObjectiveC" ||
+         M->getName().str() == "Foundation")) {
+      if (name.str().startswith("NS")) {
+        if (name.str().size() > 2 && name.str() != "NSCocoaError") {
+          auto known = getKnownFoundationEntity(name.str());
+          if (!known || !nameConflictsWithStandardLibrary(*known)) {
+            // FIXME: lowercasing magic for non-types.
+            name = getContext().getIdentifier(name.str().substr(2));
+            retrying = true;
+            goto retry;
+          }
+        }
+      } else {
+        SmallString<16> buffer;
+        buffer += "NS";
+        buffer += name.str();
+        // FIXME: Try uppercasing for non-types.
+        name = getContext().getIdentifier(buffer);
+        retrying = true;
+        goto retry;
+      }
+    }
+
     break;
   }
 
@@ -1964,6 +2018,22 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
         break;
       }
 
+      case decls_block::Swift3Migration_DECL_ATTR: {
+        bool isImplicit;
+        uint64_t renameLength;
+        uint64_t messageLength;
+        serialization::decls_block::Swift3MigrationDeclAttrLayout::readRecord(
+          scratch, isImplicit, renameLength, messageLength);
+        StringRef renameStr = blobData.substr(0, renameLength);
+        StringRef message = blobData.substr(renameLength,
+                                            renameLength + messageLength);
+        DeclName renamed = parseDeclName(getContext(), renameStr);
+        Attr = new (ctx) Swift3MigrationAttr(SourceLoc(), SourceLoc(),
+                                             SourceLoc(), renamed,
+                                             message, SourceLoc(), isImplicit);
+        break;
+      }
+
       case decls_block::WarnUnusedResult_DECL_ATTR: {
         bool isImplicit;
         uint64_t endOfMessageIndex;
@@ -1977,21 +2047,6 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
                                               ctx.AllocateCopy(message),
                                               ctx.AllocateCopy(mutableVariant),
                                               SourceLoc(), isImplicit);
-        break;
-      }
-
-      case decls_block::MigrationId_DECL_ATTR: {
-        uint64_t endOfIdentIndex;
-        serialization::decls_block::MigrationIdDeclAttrLayout::readRecord(
-          scratch, endOfIdentIndex);
-
-        StringRef ident = blobData.substr(0, endOfIdentIndex);
-        StringRef pattern = blobData.substr(endOfIdentIndex);
-        Attr = new (ctx) MigrationIdAttr(SourceLoc(), SourceLoc(),
-                                         SourceLoc(),
-                                         ctx.AllocateCopy(ident),
-                                         ctx.AllocateCopy(pattern),
-                                         SourceLoc(), /*isImplicit=*/false);
         break;
       }
 
@@ -2149,9 +2204,9 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
                                                     defaultDefinitionID);
     declOrOffset = assocType;
 
+    assocType->setArchetype(getType(archetypeID)->castTo<ArchetypeType>());
     assocType->computeType();
     assocType->setAccessibility(cast<ProtocolDecl>(DC)->getFormalAccess());
-    assocType->setArchetype(getType(archetypeID)->castTo<ArchetypeType>());
     if (isImplicit)
       assocType->setImplicit();
 
@@ -2278,6 +2333,8 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
     }
 
     auto *bodyParams0 = readParameterList();
+    bodyParams0->get(0)->setImplicit();  // self is implicit.
+    
     auto *bodyParams1 = readParameterList();
     assert(bodyParams0 && bodyParams1 && "missing parameters for constructor");
     ctor->setParameterLists(bodyParams0->get(0), bodyParams1);
@@ -2422,7 +2479,7 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
     if (declOrOffset.isComplete())
       return declOrOffset;
 
-    auto param = createDecl<ParamDecl>(isLet, SourceLoc(),
+    auto param = createDecl<ParamDecl>(isLet, SourceLoc(), SourceLoc(),
                                        getIdentifier(argNameID), SourceLoc(),
                                        getIdentifier(paramNameID), type, DC);
 
@@ -2541,6 +2598,10 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
     for (unsigned i = 0, e = numParamPatterns; i != e; ++i)
       paramLists.push_back(readParameterList());
 
+    // If the first parameter list is (self), mark it implicit.
+    if (numParamPatterns && DC->isTypeContext())
+      paramLists[0]->get(0)->setImplicit();
+    
     fn->setDeserializedSignature(paramLists,
                                  TypeLoc::withoutLoc(signature->getResult()));
 
@@ -2967,7 +3028,7 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
                                                SourceLoc(), TypeLoc(), DC);
     declOrOffset = subscript;
 
-    subscript->setIndices(readParameterList());    
+    subscript->setIndices(readParameterList());
     subscript->getElementTypeLoc() = TypeLoc::withoutLoc(getType(elemTypeID));
     
     configureStorage(subscript, rawStorageKind,
@@ -3095,6 +3156,8 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
 
     dtor->setAccessibility(cast<ClassDecl>(DC)->getFormalAccess());
     auto *selfParams = readParameterList();
+    selfParams->get(0)->setImplicit();  // self is implicit.
+
     assert(selfParams && "Didn't get self pattern?");
     dtor->setSelfDecl(selfParams->get(0));
 
@@ -3960,7 +4023,7 @@ void ModuleFile::loadAllMembers(Decl *D, uint64_t contextData) {
 
 void
 ModuleFile::loadAllConformances(const Decl *D, uint64_t contextData,
-                         SmallVectorImpl<ProtocolConformance *> &conformances) {
+                          SmallVectorImpl<ProtocolConformance*> &conformances) {
   PrettyStackTraceDecl trace("loading conformances for", D);
 
   uint64_t numConformances;
@@ -3971,8 +4034,11 @@ ModuleFile::loadAllConformances(const Decl *D, uint64_t contextData,
   BCOffsetRAII restoreOffset(DeclTypeCursor);
   DeclTypeCursor.JumpToBit(bitPosition);
 
-  while (numConformances--)
-    conformances.push_back(readConformance(DeclTypeCursor));
+  while (numConformances--) {
+    auto conf = readConformance(DeclTypeCursor);
+    if (conf.isConcrete())
+      conformances.push_back(conf.getConcrete());
+  }
 }
 
 TypeLoc
@@ -4020,23 +4086,8 @@ void ModuleFile::finishNormalConformance(NormalProtocolConformance *conformance,
     auto second = cast_or_null<ValueDecl>(getDecl(*rawIDIter++));
     assert(second || first->getAttrs().hasAttribute<OptionalAttr>() ||
            first->getAttrs().isUnavailable(ctx));
-
-    unsigned substitutionCount = *rawIDIter++;
-
-    SmallVector<Substitution, 8> substitutions;
-    while (substitutionCount--) {
-      auto sub = maybeReadSubstitution(DeclTypeCursor);
-      assert(sub.hasValue());
-      substitutions.push_back(sub.getValue());
-    }
-
-    ConcreteDeclRef witness;
-    if (substitutions.empty())
-      witness = ConcreteDeclRef(second);
-    else
-      witness = ConcreteDeclRef(ctx, second, substitutions);
-
-    witnesses.insert(std::make_pair(first, witness));
+    (void) ctx;
+    witnesses.insert(std::make_pair(first, second));
   }
   assert(rawIDIter <= rawIDs.end() && "read too much");
 

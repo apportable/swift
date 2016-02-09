@@ -18,21 +18,17 @@
 #define SWIFT_DECL_H
 
 #include "swift/AST/CaptureInfo.h"
+#include "swift/AST/ClangNode.h"
 #include "swift/AST/DefaultArgumentKind.h"
+#include "swift/AST/ExprHandle.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/LazyResolver.h"
+#include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/OptionalEnum.h"
 #include "swift/Basic/Range.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
-
-namespace clang {
-  class Decl;
-  class MacroInfo;
-  class Module;
-  class SourceLocation;
-  class SourceRange;
-}
+#include "llvm/Support/TrailingObjects.h"
 
 namespace swift {
   enum class AccessSemantics : unsigned char;
@@ -67,61 +63,12 @@ namespace swift {
   class ProtocolDecl;
   class ProtocolType;
   struct RawComment;
-  enum class Resilience : unsigned char;
+  enum class ResilienceExpansion : unsigned;
   class TypeAliasDecl;
   class Stmt;
   class SubscriptDecl;
   class ValueDecl;
   class VarDecl;
-
-/// Represents a clang declaration, macro, or module.
-class ClangNode {
-  llvm::PointerUnion3<const clang::Decl *, const clang::MacroInfo *,
-                      const clang::Module *> Ptr;
-
-public:
-  ClangNode() = default;
-  ClangNode(const clang::Decl *D) : Ptr(D) {}
-  ClangNode(const clang::MacroInfo *MI) : Ptr(MI) {}
-  ClangNode(const clang::Module *Mod) : Ptr(Mod) {}
-
-  bool isNull() const { return Ptr.isNull(); }
-  explicit operator bool() const { return !isNull(); }
-
-  const clang::Decl *getAsDecl() const {
-    return Ptr.dyn_cast<const clang::Decl *>();
-  }
-  const clang::MacroInfo *getAsMacro() const {
-    return Ptr.dyn_cast<const clang::MacroInfo *>();
-  }
-  const clang::Module *getAsModule() const {
-    return Ptr.dyn_cast<const clang::Module *>();
-  }
-
-  const clang::Decl *castAsDecl() const {
-    return Ptr.get<const clang::Decl *>();
-  }
-  const clang::MacroInfo *castAsMacro() const {
-    return Ptr.get<const clang::MacroInfo *>();
-  }
-  const clang::Module *castAsModule() const {
-    return Ptr.get<const clang::Module *>();
-  }
-
-  /// Returns the module either the one wrapped directly, the one from a
-  /// clang::ImportDecl or null if it's neither.
-  const clang::Module *getClangModule() const;
-
-  clang::SourceLocation getLocation() const;
-  clang::SourceRange getSourceRange() const;
-
-  void *getOpaqueValue() const { return Ptr.getOpaqueValue(); }
-  static inline ClangNode getFromOpaqueValue(void *VP) {
-    ClangNode N;
-    N.Ptr = decltype(Ptr)::getFromOpaqueValue(VP);
-    return N;
-  }
-};
   
 enum class DeclKind : uint8_t {
 #define DECL(Id, Parent) Id,
@@ -810,6 +757,8 @@ public:
   /// \returns the unparsed comment attached to this declaration.
   RawComment getRawComment() const;
 
+  Optional<StringRef> getGroupName() const;
+
   /// \returns the brief comment attached to this declaration.
   StringRef getBriefComment() const;
 
@@ -885,6 +834,20 @@ void *allocateMemoryForDecl(AllocatorTy &allocator, size_t baseSize,
   return mem;
 }
 
+enum class RequirementReprKind : unsigned int {
+  /// A type bound T : P, where T is a type that depends on a generic
+  /// parameter and P is some type that should bound T, either as a concrete
+  /// supertype or a protocol to which T must conform.
+  TypeConstraint,
+
+  /// A same-type requirement T == U, where T and U are types that shall be
+  /// equivalent.
+  SameType,
+
+  // Note: there is code that packs this enum in a 2-bit bitfield.  Audit users
+  // when adding enumerators.
+};
+
 /// \brief A single requirement in a 'where' clause, which places additional
 /// restrictions on the generic parameters or associated types of a generic
 /// function, type, or protocol.
@@ -895,14 +858,14 @@ void *allocateMemoryForDecl(AllocatorTy &allocator, size_t baseSize,
 /// \c GenericParamList assumes these are POD-like.
 class RequirementRepr {
   SourceLoc SeparatorLoc;
-  RequirementKind Kind : 2;
+  RequirementReprKind Kind : 2;
   bool Invalid : 1;
   TypeLoc Types[2];
   /// Set during deserialization; used to print out the requirements accurately
   /// for the generated interface.
   StringRef AsWrittenString;
 
-  RequirementRepr(SourceLoc SeparatorLoc, RequirementKind Kind,
+  RequirementRepr(SourceLoc SeparatorLoc, RequirementReprKind Kind,
                   TypeLoc FirstType, TypeLoc SecondType)
     : SeparatorLoc(SeparatorLoc), Kind(Kind), Invalid(false),
       Types{FirstType, SecondType} { }
@@ -910,7 +873,7 @@ class RequirementRepr {
   void printImpl(raw_ostream &OS, bool AsWritten) const;
 
 public:
-  /// \brief Construct a new conformance requirement.
+  /// \brief Construct a new type-constraint requirement.
   ///
   /// \param Subject The type that must conform to the given protocol or
   /// composition, or be a subclass of the given class type.
@@ -918,10 +881,10 @@ public:
   /// this requirement was implied.
   /// \param Constraint The protocol or protocol composition to which the
   /// subject must conform, or superclass from which the subject must inherit.
-  static RequirementRepr getConformance(TypeLoc Subject,
-                                    SourceLoc ColonLoc,
-                                    TypeLoc Constraint) {
-    return { ColonLoc, RequirementKind::Conformance, Subject, Constraint };
+  static RequirementRepr getTypeConstraint(TypeLoc Subject,
+                                           SourceLoc ColonLoc,
+                                           TypeLoc Constraint) {
+    return { ColonLoc, RequirementReprKind::TypeConstraint, Subject, Constraint };
   }
 
   /// \brief Construct a new same-type requirement.
@@ -931,13 +894,13 @@ public:
   /// an invalid location if this requirement was implied.
   /// \param SecondType The second type.
   static RequirementRepr getSameType(TypeLoc FirstType,
-                                 SourceLoc EqualLoc,
-                                 TypeLoc SecondType) {
-    return { EqualLoc, RequirementKind::SameType, FirstType, SecondType };
+                                     SourceLoc EqualLoc,
+                                     TypeLoc SecondType) {
+    return { EqualLoc, RequirementReprKind::SameType, FirstType, SecondType };
   }
 
   /// \brief Determine the kind of requirement
-  RequirementKind getKind() const { return Kind; }
+  RequirementReprKind getKind() const { return Kind; }
 
   /// \brief Determine whether this requirement is invalid.
   bool isInvalid() const { return Invalid; }
@@ -945,98 +908,98 @@ public:
   /// \brief Mark this requirement invalid.
   void setInvalid() { Invalid = true; }
 
-  /// \brief For a conformance requirement, return the subject of the
+  /// \brief For a type-bound requirement, return the subject of the
   /// conformance relationship.
   Type getSubject() const {
-    assert(getKind() == RequirementKind::Conformance);
+    assert(getKind() == RequirementReprKind::TypeConstraint);
     return Types[0].getType();
   }
 
   TypeRepr *getSubjectRepr() const {
-    assert(getKind() == RequirementKind::Conformance);
+    assert(getKind() == RequirementReprKind::TypeConstraint);
     return Types[0].getTypeRepr();
   }
 
   TypeLoc &getSubjectLoc() {
-    assert(getKind() == RequirementKind::Conformance);
+    assert(getKind() == RequirementReprKind::TypeConstraint);
     return Types[0];
   }
 
   const TypeLoc &getSubjectLoc() const {
-    assert(getKind() == RequirementKind::Conformance);
+    assert(getKind() == RequirementReprKind::TypeConstraint);
     return Types[0];
   }
 
-  /// \brief For a conformance requirement, return the protocol or to which
+  /// \brief For a type-bound requirement, return the protocol or to which
   /// the subject conforms or superclass it inherits.
   Type getConstraint() const {
-    assert(getKind() == RequirementKind::Conformance);
+    assert(getKind() == RequirementReprKind::TypeConstraint);
     return Types[1].getType();
   }
 
   TypeLoc &getConstraintLoc() {
-    assert(getKind() == RequirementKind::Conformance);
+    assert(getKind() == RequirementReprKind::TypeConstraint);
     return Types[1];
   }
 
   const TypeLoc &getConstraintLoc() const {
-    assert(getKind() == RequirementKind::Conformance);
+    assert(getKind() == RequirementReprKind::TypeConstraint);
     return Types[1];
   }
 
   /// \brief Retrieve the location of the ':' in an explicitly-written
   /// conformance requirement.
   SourceLoc getColonLoc() const {
-    assert(getKind() == RequirementKind::Conformance);
+    assert(getKind() == RequirementReprKind::TypeConstraint);
     return SeparatorLoc;
   }
 
   /// \brief Retrieve the first type of a same-type requirement.
   Type getFirstType() const {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return Types[0].getType();
   }
 
   TypeRepr *getFirstTypeRepr() const {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return Types[0].getTypeRepr();
   }
 
   TypeLoc &getFirstTypeLoc() {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return Types[0];
   }
 
   const TypeLoc &getFirstTypeLoc() const {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return Types[0];
   }
 
   /// \brief Retrieve the second type of a same-type requirement.
   Type getSecondType() const {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return Types[1].getType();
   }
 
   TypeRepr *getSecondTypeRepr() const {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return Types[1].getTypeRepr();
   }
 
   TypeLoc &getSecondTypeLoc() {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return Types[1];
   }
 
   const TypeLoc &getSecondTypeLoc() const {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return Types[1];
   }
 
   /// \brief Retrieve the location of the '==' in an explicitly-written
   /// same-type requirement.
   SourceLoc getEqualLoc() const {
-    assert(getKind() == RequirementKind::SameType);
+    assert(getKind() == RequirementReprKind::SameType);
     return SeparatorLoc;
   }
 
@@ -1048,6 +1011,11 @@ public:
   void setAsWrittenString(StringRef Str) {
     AsWrittenString = Str;
   }
+
+  /// Further analyze the written string, if it's not empty, to collect the first
+  /// type, the second type and the requirement kind.
+  Optional<std::tuple<StringRef, StringRef, RequirementReprKind>>
+  getAsAnalyzedWrittenString() const;
 
   SourceRange getSourceRange() const {
     return SourceRange(Types[0].getSourceRange().Start,
@@ -1067,7 +1035,10 @@ class NestedGenericParamListIterator;
 /// GenericParamList - A list of generic parameters that is part of a generic
 /// function or type, along with extra requirements placed on those generic
 /// parameters and types derived from them.
-class GenericParamList {
+class GenericParamList final :
+    private llvm::TrailingObjects<GenericParamList, GenericTypeParamDecl *> {
+  friend TrailingObjects;
+
   SourceRange Brackets;
   unsigned NumParams;
   SourceLoc WhereLoc;
@@ -1079,19 +1050,11 @@ class GenericParamList {
   SourceLoc TrailingWhereLoc;
   unsigned FirstTrailingWhereArg;
 
-  /// The builder used to build archetypes for this list.
-  ArchetypeBuilder *Builder;
-
   GenericParamList(SourceLoc LAngleLoc,
                    ArrayRef<GenericTypeParamDecl *> Params,
                    SourceLoc WhereLoc,
                    MutableArrayRef<RequirementRepr> Requirements,
                    SourceLoc RAngleLoc);
-  
-  void getAsGenericSignatureElements(ASTContext &C,
-                         llvm::DenseMap<ArchetypeType*, Type> &archetypeMap,
-                         SmallVectorImpl<GenericTypeParamType*> &genericParams,
-                         SmallVectorImpl<Requirement> &requirements) const;
   
   // Don't copy.
   GenericParamList(const GenericParamList &) = delete;
@@ -1153,11 +1116,11 @@ public:
   }
   
   MutableArrayRef<GenericTypeParamDecl *> getParams() {
-    return { reinterpret_cast<GenericTypeParamDecl **>(this + 1), NumParams };
+    return {getTrailingObjects<GenericTypeParamDecl *>(), NumParams};
   }
 
   ArrayRef<GenericTypeParamDecl *> getParams() const {
-    return const_cast<GenericParamList *>(this)->getParams();
+    return {getTrailingObjects<GenericTypeParamDecl *>(), NumParams};
   }
 
   using iterator = GenericTypeParamDecl **;
@@ -1243,11 +1206,6 @@ public:
     return getAllArchetypes().slice(0, getNumPrimaryArchetypes());
   }
   
-  /// \brief Retrieves the list containing only the associated archetypes.
-  ArrayRef<ArchetypeType *> getAssociatedArchetypes() const {
-    return getAllArchetypes().slice(getNumPrimaryArchetypes());
-  }
-
   /// \brief Sets all archetypes *without* copying the source array.
   void setAllArchetypes(ArrayRef<ArchetypeType *> AA) {
     assert(AA.size() >= size()
@@ -1325,17 +1283,7 @@ public:
       ++depth;
     return depth;
   }
-  
-  /// Get the generic parameter list as a GenericSignature in which the generic
-  /// parameters have been canonicalized.
-  ///
-  /// \param archetypeMap   This DenseMap is populated with a mapping of
-  ///                       context primary archetypes to dependent generic
-  ///                       types.
-  GenericSignature *getAsCanonicalGenericSignature(
-                           llvm::DenseMap<ArchetypeType*, Type> &archetypeMap,
-                           ASTContext &C) const;
-  
+
   /// Derive a type substitution map for this generic parameter list from a
   /// matching substitution vector.
   TypeSubstitutionMap getSubstitutionMap(ArrayRef<Substitution> Subs) const;
@@ -1347,14 +1295,6 @@ public:
                       SmallVectorImpl<ArchetypeType*> &archetypes);
 
   ArrayRef<Substitution> getForwardingSubstitutions(ASTContext &C);
-
-  void setBuilder(ArchetypeBuilder *builder) {
-    Builder = builder;
-  }
-
-  ArchetypeBuilder *getBuilder() const {
-    return Builder;
-  }
 
   /// Collect the nested archetypes of an archetype into the given
   /// collection.
@@ -1449,13 +1389,14 @@ GenericParamList::getNestedGenericParams() const {
 }
 
 /// A trailing where clause.
-class TrailingWhereClause {
+class alignas(RequirementRepr) TrailingWhereClause final :
+    private llvm::TrailingObjects<TrailingWhereClause, RequirementRepr> {
+  friend TrailingObjects;
+
   SourceLoc WhereLoc;
 
   /// The number of requirements. The actual requirements are tail-allocated.
-  /// FIXME: uintptr_t is larger than we need, but makes sure that we get the
-  /// right alignment for the requirement for the requirements that follow.
-  uintptr_t NumRequirements;
+  unsigned NumRequirements;
 
   TrailingWhereClause(SourceLoc whereLoc,
                       ArrayRef<RequirementRepr> requirements);
@@ -1470,13 +1411,12 @@ public:
 
   /// Retrieve the set of requirements.
   MutableArrayRef<RequirementRepr> getRequirements() {
-    return { reinterpret_cast<RequirementRepr *>(this + 1), NumRequirements };
+    return {getTrailingObjects<RequirementRepr>(), NumRequirements};
   }
 
   /// Retrieve the set of requirements.
   ArrayRef<RequirementRepr> getRequirements() const {
-    return { reinterpret_cast<const RequirementRepr *>(this + 1),
-             NumRequirements };
+    return {getTrailingObjects<RequirementRepr>(), NumRequirements};
   }
 
   /// Compute the source range containing this trailing where clause.
@@ -1504,7 +1444,10 @@ enum class ImportKind : uint8_t {
 /// ImportDecl - This represents a single import declaration, e.g.:
 ///   import Swift
 ///   import typealias Swift.Int
-class ImportDecl : public Decl {
+class ImportDecl final : public Decl,
+    private llvm::TrailingObjects<ImportDecl, std::pair<Identifier,SourceLoc>> {
+  friend TrailingObjects;
+
 public:
   typedef std::pair<Identifier, SourceLoc> AccessPathElement;
 
@@ -1520,13 +1463,6 @@ private:
   /// The resolved decls if this is a decl import.
   ArrayRef<ValueDecl *> Decls;
 
-  AccessPathElement *getPathBuffer() {
-    return reinterpret_cast<AccessPathElement*>(this+1);
-  }
-  const AccessPathElement *getPathBuffer() const {
-    return reinterpret_cast<const AccessPathElement*>(this+1);
-  }
-  
   ImportDecl(DeclContext *DC, SourceLoc ImportLoc, ImportKind K,
              SourceLoc KindLoc, ArrayRef<AccessPathElement> Path);
 
@@ -1550,7 +1486,7 @@ public:
   static Optional<ImportKind> findBestImportKind(ArrayRef<ValueDecl *> Decls);
 
   ArrayRef<AccessPathElement> getFullAccessPath() const {
-    return ArrayRef<AccessPathElement>(getPathBuffer(), NumPathElements);
+    return {getTrailingObjects<AccessPathElement>(), NumPathElements};
   }
 
   ArrayRef<AccessPathElement> getModulePath() const {
@@ -1860,18 +1796,36 @@ public:
 /// the initializer can be null if there is none.
 class PatternBindingEntry {
   Pattern *ThePattern;
-  llvm::PointerIntPair<Expr *, 1, bool> InitAndChecked;
-  
+
+  enum class Flags {
+    Checked = 1 << 0,
+    Removed = 1 << 1
+  };
+
+  // When the initializer is removed we don't actually clear the pointer
+  // because we might need to get initializer's source range. Since the
+  // initializer is ASTContext-allocated it is safe.
+  llvm::PointerIntPair<Expr *, 2, OptionSet<Flags>> InitCheckedAndRemoved;
+
 public:
   PatternBindingEntry(Pattern *P, Expr *E)
-    : ThePattern(P), InitAndChecked(E, false) {}
+    : ThePattern(P), InitCheckedAndRemoved(E, {}) {}
 
   Pattern *getPattern() const { return ThePattern; }
   void setPattern(Pattern *P) { ThePattern = P; }
-  Expr *getInit() const { return InitAndChecked.getPointer(); }
-  void setInit(Expr *E) { InitAndChecked.setPointer(E); }
-  bool isInitializerChecked() const { return InitAndChecked.getInt(); }
-  void setInitializerChecked() { InitAndChecked.setInt(true); }
+  Expr *getInit() const {
+    return (InitCheckedAndRemoved.getInt().contains(Flags::Removed))
+      ? nullptr : InitCheckedAndRemoved.getPointer();
+  }
+  SourceRange getOrigInitRange() const;
+  void setInit(Expr *E);
+  bool isInitializerChecked() const {
+    return InitCheckedAndRemoved.getInt().contains(Flags::Checked);
+  }
+  void setInitializerChecked() {
+    InitCheckedAndRemoved.setInt(
+      InitCheckedAndRemoved.getInt() | Flags::Checked);
+  }
 };
 
 /// \brief This decl contains a pattern and optional initializer for a set
@@ -1886,7 +1840,10 @@ public:
 /// pattern "(a, b)" and the initializer "foo()".  The second contains the
 /// pattern "(c, d)" and the initializer "bar()".
 ///
-class PatternBindingDecl : public Decl {
+class PatternBindingDecl final : public Decl,
+    private llvm::TrailingObjects<PatternBindingDecl, PatternBindingEntry> {
+  friend TrailingObjects;
+
   SourceLoc StaticLoc; ///< Location of the 'static/class' keyword, if present.
   SourceLoc VarLoc;    ///< Location of the 'var' keyword.
 
@@ -1909,11 +1866,7 @@ public:
                                     StaticSpellingKind StaticSpelling,
                                     SourceLoc VarLoc,
                                     Pattern *Pat, Expr *E,
-                                    DeclContext *Parent) {
-    return create(Ctx, StaticLoc, StaticSpelling, VarLoc,
-                  PatternBindingEntry(Pat, E), Parent);
-  }
-
+                                    DeclContext *Parent);
 
   SourceLoc getStartLoc() const {
     return StaticLoc.isValid() ? StaticLoc : VarLoc;
@@ -1931,6 +1884,10 @@ public:
     return getPatternList()[i].getInit();
   }
   
+  SourceRange getOrigInitRange(unsigned i) const {
+    return getPatternList()[i].getOrigInitRange();
+  }
+
   void setInit(unsigned i, Expr *E) {
     getMutablePatternList()[i].setInit(E);
   }
@@ -1989,10 +1946,7 @@ public:
 private:
   MutableArrayRef<PatternBindingEntry> getMutablePatternList() {
     // Pattern entries are tail allocated.
-    return {
-      reinterpret_cast<PatternBindingEntry*>(this + 1),
-      numPatternEntries
-    };
+    return {getTrailingObjects<PatternBindingEntry>(), numPatternEntries};
   }
 };
   
@@ -2382,7 +2336,7 @@ class TypeAliasDecl : public TypeDecl {
   /// The type that represents this (sugared) name alias.
   mutable NameAliasType *AliasTy;
 
-  SourceLoc TypeAliasLoc; // The location of the 'typalias' keyword
+  SourceLoc TypeAliasLoc; // The location of the 'typealias' keyword
   TypeLoc UnderlyingTy;
 
 public:
@@ -2582,7 +2536,7 @@ public:
   SourceLoc getStartLoc() const { return KeywordLoc; }
   SourceRange getSourceRange() const;
 
-  void setIsRecursive() { AssociatedTypeDeclBits.Recursive = true; }
+  void setIsRecursive();
   bool isRecursive() { return AssociatedTypeDeclBits.Recursive; }
 
   /// Whether the declaration is currently being validated.
@@ -2722,7 +2676,7 @@ class NominalTypeDecl : public TypeDecl, public DeclContext,
   friend class DeclContext;
   friend class IterableDeclContext;
   friend ArrayRef<ValueDecl *>
-           ValueDecl::getSatisfiedProtocolRequirements(bool) const;
+           ValueDecl::getSatisfiedProtocolRequirements(bool Sorted) const;
 
 protected:
   Type DeclaredTy;
@@ -2764,13 +2718,17 @@ public:
 
   /// \brief Does this declaration expose a fixed layout to all resilience
   /// domains?
+  ///
+  /// For structs, this means clients can assume the number and order of
+  /// stored properties will not change.
+  ///
+  /// For enums, this means clients can assume the number and order of
+  /// cases will not change.
   bool hasFixedLayout() const;
 
   /// \brief Does this declaration expose a fixed layout to the given
   /// module?
-  bool hasFixedLayout(ModuleDecl *M) const {
-    return (hasFixedLayout() || M == getModuleContext());
-  }
+  bool hasFixedLayout(ModuleDecl *M, ResilienceExpansion expansion) const;
 
   void setMemberLoader(LazyMemberLoader *resolver, uint64_t contextData);
   bool hasLazyMembers() const {
@@ -2827,12 +2785,12 @@ public:
   /// Set the generic signature of this type.
   void setGenericSignature(GenericSignature *sig);
 
-  /// Retrieve the generic parameter types.
-  ArrayRef<GenericTypeParamType *> getGenericParamTypes() const {
+  /// Retrieve the innermost generic parameter types.
+  ArrayRef<GenericTypeParamType *> getInnermostGenericParamTypes() const {
     if (!GenericSig)
       return { };
 
-    return GenericSig->getGenericParams();
+    return GenericSig->getInnermostGenericParams();
   }
 
   /// Retrieve the generic requirements.
@@ -3597,9 +3555,9 @@ public:
     ///      to and may be overridden.
     ///   2) When a stored property satisfies a protocol requirement, these
     ///      accessors end up as entries in the witness table.
-    ///   3) Perhaps someday these will be used by accesses outside of this
-    ///      resilience domain, when the owning type is resilient.
-    ///
+    ///   3) When a stored property is accessed outside of the storage
+    ///      declaration's resilience domain, when the owning type or
+    ///      global variable is resilient.
     StoredWithTrivialAccessors,
 
     /// This is a stored property with either a didSet specifier or a
@@ -3694,9 +3652,6 @@ private:
   };
   void configureObservingRecord(ObservingRecord *record,
                                 FuncDecl *willSet, FuncDecl *didSet);
-
-  struct GetSetRecordWithAddressors : AddressorRecord, GetSetRecord {};
-  struct ObservingRecordWithAddressors : AddressorRecord, ObservingRecord {};
 
   llvm::PointerIntPair<GetSetRecord*, 2, OptionalEnum<Accessibility>> GetSetInfo;
 
@@ -3982,7 +3937,7 @@ public:
 
   /// Whether the declaration is later overridden in the module
   ///
-  /// Overriddes are resolved during type checking; only query this field after
+  /// Overrides are resolved during type checking; only query this field after
   /// the whole module has been checked
   bool isOverridden() const { return AbstractStorageDeclBits.Overridden; }
 
@@ -3998,6 +3953,18 @@ public:
   /// Determine how this storage declaration should actually be accessed.
   AccessStrategy getAccessStrategy(AccessSemantics semantics,
                                    AccessKind accessKind) const;
+
+  /// \brief Does this declaration expose a fixed layout to all resilience
+  /// domains?
+  ///
+  /// Roughly speaking, this means we can make assumptions about whether
+  /// the storage is stored or computed, and if stored, the precise access
+  /// pattern to be used.
+  bool hasFixedLayout() const;
+
+  /// \brief Does this declaration expose a fixed layout to the given
+  /// module?
+  bool hasFixedLayout(ModuleDecl *M, ResilienceExpansion expansion) const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
@@ -4162,6 +4129,7 @@ public:
 class ParamDecl : public VarDecl {
   Identifier ArgumentName;
   SourceLoc ArgumentNameLoc;
+  SourceLoc LetVarInOutLoc;
 
   /// This is the type specified, including location information.
   TypeLoc typeLoc;
@@ -4176,11 +4144,11 @@ class ParamDecl : public VarDecl {
   /// resolve the type.
   bool IsTypeLocImplicit = false;
   
-  /// Information about a symbolic default argument, like __FILE__.
+  /// Information about a symbolic default argument, like #file.
   DefaultArgumentKind defaultArgumentKind = DefaultArgumentKind::None;
   
 public:
-  ParamDecl(bool isLet, SourceLoc argumentNameLoc, 
+  ParamDecl(bool isLet, SourceLoc letVarInOutLoc, SourceLoc argumentNameLoc,
             Identifier argumentName, SourceLoc parameterNameLoc,
             Identifier parameterName, Type ty, DeclContext *dc);
 
@@ -4197,6 +4165,8 @@ public:
   /// The resulting source location will be valid if the argument name
   /// was specified separately from the parameter name.
   SourceLoc getArgumentNameLoc() const { return ArgumentNameLoc; }
+
+  SourceLoc getLetVarInOutLoc() const { return LetVarInOutLoc; }
   
   TypeLoc &getTypeLoc() { return typeLoc; }
   TypeLoc getTypeLoc() const { return typeLoc; }
@@ -4646,7 +4616,7 @@ public:
 
   /// Whether the declaration is later overridden in the module
   ///
-  /// Overriddes are resolved during type checking; only query this field after
+  /// Overrides are resolved during type checking; only query this field after
   /// the whole module has been checked
   bool isOverridden() const { return AbstractFunctionDeclBits.Overridden; }
 
@@ -4686,8 +4656,10 @@ class OperatorDecl;
 
 
 /// FuncDecl - 'func' declaration.
-class FuncDecl : public AbstractFunctionDecl {
+class FuncDecl final : public AbstractFunctionDecl,
+    private llvm::TrailingObjects<FuncDecl, ParameterList *> {
   friend class AbstractFunctionDecl;
+  friend TrailingObjects;
 
   SourceLoc StaticLoc;  // Location of the 'static' token or invalid.
   SourceLoc FuncLoc;    // Location of the 'func' token.
@@ -4792,11 +4764,10 @@ public:
   /// The number of "top-level" elements will match the number of argument names
   /// in the compound name of the function or constructor.
   MutableArrayRef<ParameterList *> getParameterLists() {
-    auto Ptr = reinterpret_cast<ParameterList **>(cast<FuncDecl>(this) + 1);
-    return { Ptr, getNumParameterLists() };
+    return {getTrailingObjects<ParameterList *>(), getNumParameterLists()};
   }
   ArrayRef<const ParameterList *> getParameterLists() const {
-    return AbstractFunctionDecl::getParameterLists();
+    return {getTrailingObjects<ParameterList *>(), getNumParameterLists()};
   }
   ParameterList *getParameterList(unsigned i) {
     return getParameterLists()[i];
@@ -4832,7 +4803,7 @@ public:
   SourceLoc getAccessorKeywordLoc() const {return AccessorKeywordLoc; }
 
   SourceLoc getStartLoc() const {
-    return StaticLoc.isValid() ? StaticLoc : FuncLoc;
+    return StaticLoc.isValid() && !isAccessor() ? StaticLoc : FuncLoc;
   }
   SourceRange getSourceRange() const;
 
@@ -5021,7 +4992,9 @@ public:
   
 /// \brief This represents a 'case' declaration in an 'enum', which may declare
 /// one or more individual comma-separated EnumElementDecls.
-class EnumCaseDecl : public Decl {
+class EnumCaseDecl final : public Decl,
+    private llvm::TrailingObjects<EnumCaseDecl, EnumElementDecl *> {
+  friend TrailingObjects;
   SourceLoc CaseLoc;
   
   /// The number of tail-allocated element pointers.
@@ -5033,13 +5006,10 @@ class EnumCaseDecl : public Decl {
     : Decl(DeclKind::EnumCase, DC),
       CaseLoc(CaseLoc), NumElements(Elements.size())
   {
-    memcpy(this + 1, Elements.begin(), NumElements * sizeof(EnumElementDecl*));
+    std::uninitialized_copy(Elements.begin(), Elements.end(),
+                            getTrailingObjects<EnumElementDecl *>());
   }
-  
-  EnumElementDecl * const *getElementsBuf() const {
-    return reinterpret_cast<EnumElementDecl * const*>(this + 1);
-  }
-  
+
 public:
   static EnumCaseDecl *create(SourceLoc CaseLoc,
                               ArrayRef<EnumElementDecl*> Elements,
@@ -5047,7 +5017,7 @@ public:
   
   /// Get the list of elements declared in this case.
   ArrayRef<EnumElementDecl *> getElements() const {
-    return {getElementsBuf(), NumElements};
+    return {getTrailingObjects<EnumElementDecl *>(), NumElements};
   }
   
   SourceLoc getLoc() const {

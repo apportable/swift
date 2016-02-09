@@ -20,6 +20,7 @@
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerUnion.h"
+#include "llvm/Support/TrailingObjects.h"
 
 namespace llvm {
   class raw_ostream;
@@ -118,8 +119,12 @@ public:
         || (C >= 0xE0100 && C <= 0xE01EF);
   }
 
+  static bool isEditorPlaceholder(StringRef name) {
+    return name.startswith("<#");
+  }
+
   bool isEditorPlaceholder() const {
-    return !empty() && Pointer[0] == '<' && Pointer[1] == '#';
+    return !empty() && isEditorPlaceholder(str());
   }
   
   void *getAsOpaquePointer() const { return (void *)Pointer; }
@@ -201,7 +206,11 @@ class DeclName {
   friend class ASTContext;
 
   /// Represents a compound
-  struct alignas(Identifier*) CompoundDeclName : llvm::FoldingSetNode {
+  struct alignas(Identifier) CompoundDeclName final : llvm::FoldingSetNode,
+      private llvm::TrailingObjects<CompoundDeclName, Identifier> {
+    friend TrailingObjects;
+    friend class DeclName;
+
     Identifier BaseName;
     size_t NumArgs;
     
@@ -212,10 +221,10 @@ class DeclName {
     }
     
     ArrayRef<Identifier> getArgumentNames() const {
-      return {reinterpret_cast<const Identifier*>(this + 1), NumArgs};
+      return {getTrailingObjects<Identifier>(), NumArgs};
     }
     MutableArrayRef<Identifier> getArgumentNames() {
-      return {reinterpret_cast<Identifier*>(this + 1), NumArgs};
+      return {getTrailingObjects<Identifier>(), NumArgs};
     }
       
     /// Uniquing for the ASTContext.
@@ -376,6 +385,14 @@ public:
 
   void *getOpaqueValue() const { return SimpleOrCompound.getOpaqueValue(); }
   static DeclName getFromOpaqueValue(void *p) { return DeclName(p); }
+
+  /// Print the representation of this declaration name to the given
+  /// stream.
+  ///
+  /// \param skipEmptyArgumentNames When true, don't print the argument labels
+  /// if they are all empty.
+  llvm::raw_ostream &print(llvm::raw_ostream &os,
+                           bool skipEmptyArgumentNames = false) const;
 
   /// Print a "pretty" representation of this declaration name to the given
   /// stream.

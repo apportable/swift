@@ -341,8 +341,6 @@ The type of a value in SIL shall be:
 
 - the address of a legal SIL type, ``$*T``, or
 
-- the address of local storage of a legal SIL type, ``$*@local_storage T``.
-
 A type ``T`` is a *legal SIL type* if:
 
 - it is a function type which satisfies the constraints (below) on
@@ -385,22 +383,6 @@ type. Values of address type thus cannot be allocated, loaded, or stored
 
 Addresses can be passed as arguments to functions if the corresponding
 parameter is indirect.  They cannot be returned.
-
-Local Storage Types
-```````````````````
-
-The *address of local storage for T* ``$*@local_storage T`` is a
-handle to a stack allocation of a variable of type ``$T``.
-
-For many types, the handle for a stack allocation is simply the
-allocated address itself.  However, if a type is runtime-sized, the
-compiler must emit code to potentially dynamically allocate memory.
-SIL abstracts over such differences by using values of local-storage
-type as the first result of ``alloc_stack`` and the operand of
-``dealloc_stack``.
-
-Local-storage address types are not *first-class* in the same sense
-that address types are not first-class.
 
 Box Types
 `````````
@@ -594,7 +576,7 @@ generic constraints:
   * Non-class protocol types
   * @weak types
 
-  Values of address-only type (“address-only values”) must reside in
+  Values of address-only type ("address-only values") must reside in
   memory and can only be referenced in SIL by address. Addresses of
   address-only values cannot be loaded from or stored to. SIL provides
   special instructions for indirectly manipulating address-only
@@ -721,7 +703,7 @@ Values and Operands
 
   sil-identifier ::= [A-Za-z_0-9]+
   sil-value-name ::= '%' sil-identifier
-  sil-value ::= sil-value-name ('#' [0-9]+)?
+  sil-value ::= sil-value-name
   sil-value ::= 'undef'
   sil-operand ::= sil-value ':' sil-type
 
@@ -729,17 +711,6 @@ SIL values are introduced with the ``%`` sigil and named by an
 alphanumeric identifier, which references the instruction or basic block
 argument that produces the value.  SIL values may also refer to the keyword
 'undef', which is a value of undefined contents.
-In SIL, a single instruction may produce multiple values. Operands that refer
-to multiple-value instructions choose the value by following the ``%name`` with
-``#`` and the index of the value. For example::
-
-  // alloc_box produces two values--the refcounted pointer %box#0, and the
-  // value address %box#1
-  %box = alloc_box $Int64
-  // Refer to the refcounted pointer
-  strong_retain %box#0 : $@box Int64
-  // Refer to the address
-  store %value to %box#1 : $*Int64
 
 Unlike LLVM IR, SIL instructions that take value operands *only* accept
 value operands. References to literal constants, functions, global variables, or
@@ -1076,11 +1047,10 @@ instances. Derived classes inherit the witness tables of their base class.
 Witness tables are keyed by *protocol conformance*, which is a unique identifier
 for a concrete type's conformance to a protocol.
 
-- A *normal protocol conformance*
-  names a (potentially unbound generic) type, the protocol it conforms to, and
-  the module in which the type or extension declaration that provides the
-  conformance appears. These correspond 1:1 to protocol conformance declarations
-  in the source code.
+- A *normal protocol conformance* names a (potentially unbound generic) type,
+  the protocol it conforms to, and the module in which the type or extension
+  declaration that provides the conformance appears. These correspond 1:1 to
+  protocol conformance declarations in the source code.
 - If a derived class conforms to a protocol through inheritance from its base
   class, this is represented by an *inherited protocol conformance*, which
   simply references the protocol conformance for the base class.
@@ -1116,6 +1086,55 @@ Witness tables consist of the following entries:
   type to the protocol conformance that satisfies that requirement for the
   associated type.
 
+Default Witness Tables
+~~~~~~~~~~~~~~~~~~~~~~
+::
+
+  decl ::= sil-default-witness-table
+  sil-default-witness-table ::= 'sil_default_witness_table'
+                                identifier minimum-witness-table-size
+                                '{' sil-default-witness-entry* '}'
+  minimum-witness-table-size ::= integer
+
+SIL encodes requirements with resilient default implementations in a default
+witness table. We say a requirement has a resilient default implementation if
+the following conditions hold:
+
+- The requirement has a default implementation
+- The requirement is either the last requirement in the protocol, or all
+  subsequent requirements also have resilient default implementations
+
+The set of requirements with resilient default implementations is stored in
+protocol metadata.
+
+The minimum witness table size is the size of the witness table, in words,
+not including any requirements with resilient default implementations.
+
+Any conforming witness table must have a size between the minimum size, and
+the maximum size, which is equal to the minimum size plus the number of
+default requirements.
+
+At load time, if the runtime encounters a witness table with fewer than the
+maximum number of witnesses, the witness table is copied, with default
+witnesses copied in. This ensures that callers can always expect to find
+the correct number of requirements in each witness table, and new
+requirements can be added by the framework author, without breaking client
+code, as long as the new requirements have resilient default implementations.
+
+Default witness tables are keyed by the protocol itself. Only protocols with
+public visibility need a default witness table; private and internal protocols
+are never seen outside the module, therefore there are no resilience issues
+with adding new requirements.
+
+::
+
+  sil-default-witness-entry ::= 'method' sil-decl-ref ':' sil-function-name
+
+Default witness tables currently contain only one type of entry:
+
+- *Method entries* map a method requirement of the protocol to a SIL function
+  that implements that method in a manner suitable for all witness types.
+
 Global Variables
 ~~~~~~~~~~~~~~~~
 ::
@@ -1125,7 +1144,12 @@ Global Variables
 
 SIL representation of a global variable.
 
-FIXME: to be written.
+Global variable access is performed by the ``alloc_global`` and ``global_addr``
+SIL instructions. Prior to performing any access on the global, the
+``alloc_global`` instruction must be performed to initialize the storage.
+
+Once a global's storage has been initialized, ``global_addr`` is used to
+project the value.
 
 Dataflow Errors
 ---------------
@@ -1559,8 +1583,8 @@ A value ``%1`` is said to be *value-dependent* on a value ``%0`` if:
 - ``%1`` is the result of ``mark_dependence`` and ``%0`` is either of
   the operands.
 
-- ``%1`` is the value address of an allocation instruction of which
-  ``%0`` is the local storage token or box reference.
+- ``%1`` is the value address of a box allocation instruction of which
+  ``%0`` is the box reference.
 
 - ``%1`` is the result of a ``struct``, ``tuple``, or ``enum``
   instruction and ``%0`` is an operand.
@@ -1634,13 +1658,15 @@ alloc_stack
   sil-instruction ::= 'alloc_stack' sil-type (',' debug-var-attr)*
 
   %1 = alloc_stack $T
-  // %1#0 has type $*@local_storage T
-  // %1#1 has type $*T
+  // %1 has type $*T
 
 Allocates uninitialized memory that is sufficiently aligned on the stack
-to contain a value of type ``T``. The first result of the instruction
-is a local-storage handle suitable for passing to ``dealloc_stack``.
-The second result of the instruction is the address of the allocated memory.
+to contain a value of type ``T``. The result of the instruction is the address
+of the allocated memory.
+
+If a type is runtime-sized, the compiler must emit code to potentially
+dynamically allocate memory. So there is no guarantee that the allocated
+memory is really located on the stack. 
 
 ``alloc_stack`` marks the start of the lifetime of the value; the
 allocation must be balanced with a ``dealloc_stack`` instruction to
@@ -1701,15 +1727,13 @@ alloc_box
   sil-instruction ::= 'alloc_box' sil-type (',' debug-var-attr)*
 
   %1 = alloc_box $T
-  // %1 has two values:
-  //   %1#0 has type $@box T
-  //   %1#1 has type $*T
+  //   %1 has type $@box T
 
 Allocates a reference-counted ``@box`` on the heap large enough to hold a value
 of type ``T``, along with a retain count and any other metadata required by the
-runtime.  The result of the instruction is a two-value operand; the first value
-is the reference-counted ``@box`` reference that owns the box, and the second
-value is the address of the value inside the box.
+runtime.  The result of the instruction is the reference-counted ``@box``
+reference that owns the box. The ``project_box`` instruction is used to retrieve
+the address of the value inside the box.
 
 The box will be initialized with a retain count of 1; the storage will be
 uninitialized. The box owns the contained value, and releasing it to a retain
@@ -1735,22 +1759,36 @@ behavior if the value buffer is currently allocated.
 
 The type operand must be a lowered object type.
 
+alloc_global
+````````````
+
+::
+
+   sil-instruction ::= 'alloc_global' sil-global-name
+
+   alloc_global @foo
+
+Initialize the storage for a global variable. This instruction has
+undefined behavior if the global variable has already been initialized.
+
+The type operand must be a lowered object type.
+
 dealloc_stack
 `````````````
 ::
 
   sil-instruction ::= 'dealloc_stack' sil-operand
 
-  dealloc_stack %0 : $*@local_storage T
-  // %0 must be of a local-storage $*@local_storage T type
+  dealloc_stack %0 : $*T
+  // %0 must be of $*T type
 
 Deallocates memory previously allocated by ``alloc_stack``. The
 allocated value in memory must be uninitialized or destroyed prior to
 being deallocated. This instruction marks the end of the lifetime for
 the value created by the corresponding ``alloc_stack`` instruction. The operand
-must be the ``@local_storage`` of the shallowest live ``alloc_stack``
-allocation preceding the deallocation. In other words, deallocations must be
-in last-in, first-out stack order.
+must be the shallowest live ``alloc_stack`` allocation preceding the
+deallocation. In other words, deallocations must be in last-in, first-out
+stack order.
 
 dealloc_box
 ```````````
@@ -2400,7 +2438,7 @@ function_ref
 Creates a reference to a SIL function.
 
 global_addr
-```````````````
+```````````
 
 ::
 
@@ -2408,7 +2446,10 @@ global_addr
 
   %1 = global_addr @foo : $*Builtin.Word
 
-Creates a reference to the address of a global variable.
+Creates a reference to the address of a global variable which has been
+previously initialized by ``alloc_global``. It is undefined behavior to
+perform this operation on a global variable which has not been
+initialized.
 
 integer_literal
 ```````````````
@@ -2446,6 +2487,7 @@ string_literal
   sil-instruction ::= 'string_literal' encoding string-literal
   encoding ::= 'utf8'
   encoding ::= 'utf16'
+  encoding ::= 'objc_selector'
 
   %1 = string_literal "asdf"
   // %1 has type $Builtin.RawPointer
@@ -2453,7 +2495,10 @@ string_literal
 Creates a reference to a string in the global string table. The result
 is a pointer to the data.  The referenced string is always null-terminated. The
 string literal value is specified using Swift's string
-literal syntax (though ``\()`` interpolations are not allowed).
+literal syntax (though ``\()`` interpolations are not allowed). When
+the encoding is ``objc_selector``, the string literal produces a
+reference to a UTF-8-encoded Objective-C selector in the Objective-C
+method name segment.
 
 Dynamic Dispatch
 ~~~~~~~~~~~~~~~~
@@ -2735,11 +2780,12 @@ lowers to an uncurried entry point and is curried in the enclosing function::
   entry(%x : $Int):
     // Create a box for the 'x' variable
     %x_box = alloc_box $Int
-    store %x to %x_box#1 : $*Int
+    %x_addr = project_box %x_box : $@box Int
+    store %x to %x_addr : $*Int
 
     // Create the bar closure
     %bar_uncurried = function_ref @bar : $(Int, Int) -> Int
-    %bar = partial_apply %bar_uncurried(%x_box#0, %x_box#1) \
+    %bar = partial_apply %bar_uncurried(%x_box, %x_addr) \
       : $(Int, Builtin.NativeObject, *Int) -> Int
 
     // Apply it
@@ -3269,6 +3315,7 @@ container may use one of several representations:
   containers:
 
   * `alloc_existential_box`_
+  * `project_existential_box`_
   * `open_existential_box`_
   * `dealloc_existential_box`_
 
@@ -3283,8 +3330,9 @@ more expensive ``alloc_existential_box``::
     // The slow general way to form an ErrorType, allocating a box and
     // storing to its value buffer:
     %error1 = alloc_existential_box $ErrorType, $NSError
+    %addr = project_existential_box $NSError in %error1 : $ErrorType
     strong_retain %nserror: $NSError
-    store %nserror to %error1#1 : $NSError
+    store %nserror to %addr : $NSError
 
     // The fast path supported for NSError:
     strong_retain %nserror: $NSError
@@ -3426,7 +3474,7 @@ alloc_existential_box
   // $P must be a protocol or protocol composition type with boxed
   //   representation
   // $T must be an AST type that conforms to P
-  // %1#0 will be of type $P
+  // %1 will be of type $P
   // %1#1 will be of type $*T', where T' is the most abstracted lowering of T
 
 Allocates a boxed existential container of type ``$P`` with space to hold a
@@ -3434,8 +3482,25 @@ value of type ``$T'``. The box is not fully initialized until a valid value
 has been stored into the box. If the box must be deallocated before it is
 fully initialized, ``dealloc_existential_box`` must be used. A fully
 initialized box can be ``retain``-ed and ``release``-d like any
-reference-counted type.  The address ``%0#1`` is dependent on the lifetime of
-the owner reference ``%0#0``.
+reference-counted type.  The ``project_existential_box`` instruction is used
+to retrieve the address of the value inside the container.
+
+project_existential_box
+```````````````````````
+::
+
+  sil-instruction ::= 'project_existential_box' sil-type 'in' sil-operand
+
+  %1 = project_existential_box $T in %0 : $P
+  // %0 must be a value of boxed protocol or protocol composition type $P
+  // $T must be the most abstracted lowering of the AST type for which the box
+  // was allocated
+  // %1 will be of type $*T
+
+Projects the address of the value inside a boxed existential container.
+The address is dependent on the lifetime of the owner reference ``%0``.
+It is undefined behavior if the concrete type ``$T`` is not the same type for
+which the box was allocated with ``alloc_existential_box``.
 
 open_existential_box
 ````````````````````

@@ -26,6 +26,7 @@ namespace swift {
   struct ProtocolDescriptor;
 
 #if SWIFT_HAS_ISA_MASKING
+  SWIFT_RUNTIME_EXPORT
   extern "C" uintptr_t swift_isaMask;
 #endif
 
@@ -110,6 +111,14 @@ namespace swift {
   ///
   /// Returns true if common value witnesses were used, false otherwise.
   void installCommonValueWitnesses(ValueWitnessTable *vwtable);
+
+  const Metadata *
+  _matchMetadataByMangledTypeName(const llvm::StringRef metadataNameRef,
+                                  const Metadata *metadata,
+                                  const NominalTypeDescriptor *ntd);
+
+  const Metadata *
+  _searchConformancesByMangledTypeName(const llvm::StringRef typeName);
 
 #if SWIFT_OBJC_INTEROP
   Demangle::NodePointer _swift_buildDemanglingForMetadata(const Metadata *type);

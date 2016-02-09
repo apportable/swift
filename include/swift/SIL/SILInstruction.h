@@ -17,17 +17,19 @@
 #ifndef SWIFT_SIL_INSTRUCTION_H
 #define SWIFT_SIL_INSTRUCTION_H
 
-#include "llvm/ADT/ilist_node.h"
-#include "llvm/ADT/ilist.h"
-#include "llvm/ADT/APFloat.h"
-#include "llvm/ADT/APInt.h"
 #include "swift/AST/Builtins.h"
+#include "swift/AST/ProtocolConformanceRef.h"
 #include "swift/SIL/Consumption.h"
 #include "swift/SIL/SILAllocated.h"
 #include "swift/SIL/SILLocation.h"
 #include "swift/SIL/SILSuccessor.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILValue.h"
+#include "llvm/ADT/ilist_node.h"
+#include "llvm/ADT/ilist.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/Support/TrailingObjects.h"
 
 namespace swift {
 
@@ -81,11 +83,9 @@ class SILInstruction : public ValueBase,public llvm::ilist_node<SILInstruction>{
   void setDebugScope(SILBuilder &B, const SILDebugScope *DS);
 
 protected:
-  SILInstruction(ValueKind Kind, SILDebugLocation *DebugLoc, SILType Ty)
-      : ValueBase(Kind, Ty), ParentBB(0), Location(*DebugLoc) {}
   SILInstruction(ValueKind Kind, SILDebugLocation *DebugLoc,
-                 SILTypeList *TypeList = nullptr)
-      : ValueBase(Kind, TypeList), ParentBB(0), Location(*DebugLoc) {}
+                 SILType Ty = SILType())
+      : ValueBase(Kind, Ty), ParentBB(0), Location(*DebugLoc) {}
 
 public:
   /// Instructions should be allocated using a dedicated instruction allocation
@@ -199,19 +199,12 @@ public:
   template <typename OpCmp>
   bool isIdenticalTo(const SILInstruction *RHS, OpCmp opEqual) const {
     // Quick check if both instructions have the same kind, number of operands,
-    // and number of types. This should filter out most cases.
+    // and types. This should filter out most cases.
     if (getKind() != RHS->getKind() ||
         getNumOperands() != RHS->getNumOperands() ||
-        getNumTypes() != RHS->getNumTypes()) {
+        getType() != RHS->getType()) {
       return false;
     }
-    
-    // Check types.
-    //
-    // Many instructions have only 1 type so it makes sense to check it first.
-    for (unsigned i = 0, e = getNumTypes(); i != e; ++i)
-      if (getType(i) != RHS->getType(i))
-        return false;
     
     // Check operands.
     for (unsigned i = 0, e = getNumOperands(); i != e; ++i)
@@ -342,9 +335,9 @@ public:
   /// getType() is ok if this is known to only have one type.
   template<typename X = void>
   typename std::enable_if<has_result<X>::value, SILType>::type
-  getType(unsigned i = 0) const { return ValueBase::getType(i); }
+  getType() const { return ValueBase::getType(); }
 
-  ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }\
+  ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
 
   static bool classof(const ValueBase *V) {
@@ -407,9 +400,6 @@ class AllocationInst : public SILInstruction {
 protected:
   AllocationInst(ValueKind Kind, SILDebugLocation *DebugLoc, SILType Ty)
       : SILInstruction(Kind, DebugLoc, Ty) {}
-  AllocationInst(ValueKind Kind, SILDebugLocation *DebugLoc,
-                 SILTypeList *TypeList = nullptr)
-      : SILInstruction(Kind, DebugLoc, TypeList) {}
 
 public:
 
@@ -439,7 +429,9 @@ public:
 
 /// AllocStackInst - This represents the allocation of an unboxed (i.e., no
 /// reference count) stack memory.  The memory is provided uninitialized.
-class AllocStackInst : public AllocationInst {
+class AllocStackInst final : public AllocationInst,
+    private llvm::TrailingObjects<AllocStackInst, char> {
+  friend TrailingObjects;
   friend class SILBuilder;
   TailAllocatedDebugVariable VarInfo;
 
@@ -456,18 +448,15 @@ public:
 
   /// Return the debug variable information attached to this instruction.
   SILDebugVariable getVarInfo() const {
-    return VarInfo.get(getDecl(), reinterpret_cast<const char *>(this + 1));
+    return VarInfo.get(getDecl(), getTrailingObjects<char>());
   };
   void setArgNo(unsigned N) { VarInfo.setArgNo(N); }
 
   /// getElementType - Get the type of the allocated memory (as opposed to the
-  /// (second) type of the instruction itself, which will be an address type).
+  /// type of the instruction itself, which will be an address type).
   SILType getElementType() const {
-    return getType(1).getObjectType();
+    return getType().getObjectType();
   }
-
-  SILValue getContainerResult() const { return SILValue(this, 0); }
-  SILValue getAddressResult() const { return SILValue(this, 1); }
 
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
@@ -488,8 +477,6 @@ class AllocRefInst : public AllocationInst, public StackPromotable {
                bool canBeOnStack);
 
 public:
-
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
 
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
@@ -543,7 +530,9 @@ public:
 /// pointer with Builtin.NativeObject type.  The second return value
 /// is an address pointing to the contained element. The contained
 /// element is uninitialized.
-class AllocBoxInst : public AllocationInst {
+class AllocBoxInst final : public AllocationInst,
+    private llvm::TrailingObjects<AllocBoxInst, char> {
+  friend TrailingObjects;
   friend class SILBuilder;
 
   TailAllocatedDebugVariable VarInfo;
@@ -556,11 +545,9 @@ class AllocBoxInst : public AllocationInst {
 public:
 
   SILType getElementType() const {
-    return getType(1).getObjectType();
+    return SILType::getPrimitiveObjectType(getType().castTo<SILBoxType>()->
+                                           getBoxedType());
   }
-
-  SILValue getContainerResult() const { return SILValue(this, 0); }
-  SILValue getAddressResult() const { return SILValue(this, 1); }
 
   /// Return the underlying variable declaration associated with this
   /// allocation, or null if this is a temporary allocation.
@@ -568,7 +555,7 @@ public:
 
   /// Return the debug variable information attached to this instruction.
   SILDebugVariable getVarInfo() const {
-    return VarInfo.get(getDecl(), reinterpret_cast<const char *>(this + 1));
+    return VarInfo.get(getDecl(), getTrailingObjects<char>());
   };
 
   ArrayRef<Operand> getAllOperands() const { return {}; }
@@ -586,19 +573,18 @@ public:
 /// value is uninitialized.
 class AllocExistentialBoxInst : public AllocationInst {
   friend class SILBuilder;
-
   CanType ConcreteType;
-  ArrayRef<ProtocolConformance*> Conformances;
+  ArrayRef<ProtocolConformanceRef> Conformances;
 
   AllocExistentialBoxInst(SILDebugLocation *DebugLoc, SILType ExistentialType,
-                          CanType ConcreteType, SILType ConcreteLoweredType,
-                          ArrayRef<ProtocolConformance *> Conformances,
+                          CanType ConcreteType,
+                          ArrayRef<ProtocolConformanceRef> Conformances,
                           SILFunction *Parent);
 
   static AllocExistentialBoxInst *
   create(SILDebugLocation *DebugLoc, SILType ExistentialType,
-         CanType ConcreteType, SILType ConcreteLoweredType,
-         ArrayRef<ProtocolConformance *> Conformances, SILFunction *Parent);
+         CanType ConcreteType,
+         ArrayRef<ProtocolConformanceRef> Conformances, SILFunction *Parent);
 
 public:
   CanType getFormalConcreteType() const {
@@ -606,19 +592,12 @@ public:
   }
   
   SILType getExistentialType() const {
-    return getType(0);
+    return getType();
   }
 
-  SILType getLoweredConcreteType() const {
-    return getType(1);
-  }
-
-  ArrayRef<ProtocolConformance*> getConformances() const {
+  ArrayRef<ProtocolConformanceRef> getConformances() const {
     return Conformances;
   }
-  
-  SILValue getExistentialResult() const { return SILValue(this, 0); }
-  SILValue getValueAddressResult() const { return SILValue(this, 1); }
   
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
@@ -710,7 +689,7 @@ public:
 
   /// Get the type of the callee without the applied substitutions.
   CanSILFunctionType getOrigCalleeType() const {
-    return getCallee().getType().template castTo<SILFunctionType>();
+    return getCallee()->getType().template castTo<SILFunctionType>();
   }
 
   /// Get the type of the callee with the applied substitutions.
@@ -921,9 +900,6 @@ class ApplyInst : public ApplyInstBase<ApplyInst, SILInstruction> {
                            SILFunction &F);
 
 public:
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   static bool classof(const ValueBase *V) {
     return V->getKind() == ValueKind::ApplyInst;
   }
@@ -953,10 +929,6 @@ class PartialApplyInst
                                   SILFunction &F);
 
 public:
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
-
   /// Return the ast level function type of this partial apply.
   CanSILFunctionType getFunctionType() const {
     return getType().castTo<SILFunctionType>();
@@ -993,7 +965,7 @@ class FunctionRefInst : public LiteralInst {
   /// Construct a FunctionRefInst.
   ///
   /// \param DebugLoc  The location of the reference.
-  /// \param F    The function being referenced.
+  /// \param F         The function being referenced.
   FunctionRefInst(SILDebugLocation *DebugLoc, SILFunction *F);
 
 public:
@@ -1003,10 +975,6 @@ public:
   SILFunction *getReferencedFunction() const { return Function; }
 
   void dropReferencedFunction();
-
-  /// getType() is ok since this is known to only have one type.
-  /// The type is always a lowered function type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
 
   CanSILFunctionType getFunctionType() const {
     return getType().castTo<SILFunctionType>();
@@ -1055,10 +1023,6 @@ public:
   Identifier getName() const { return Name; }
   void setName(Identifier I) { Name = I; }
   
-  /// Currently all builtins have one result, so getType() is OK.
-  /// We may want to change that eventually.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   /// \brief Looks up the llvm intrinsic ID and type for the builtin function.
   ///
   /// \returns Returns llvm::Intrinsic::not_intrinsic if the function is not an
@@ -1120,10 +1084,40 @@ public:
   }
 };
   
-/// Gives the address of a SIL global variable.
-class GlobalAddrInst : public LiteralInst {
+/// Initializes a SIL global variable. Only valid once, before any
+/// usages of the global via GlobalAddrInst.
+class AllocGlobalInst : public SILInstruction {
   friend class SILBuilder;
 
+  SILGlobalVariable *Global;
+
+  AllocGlobalInst(SILDebugLocation *DebugLoc, SILGlobalVariable *Global);
+
+public:
+  // FIXME: This constructor should be private but is currently used
+  //        in the SILParser.
+
+  /// Create a placeholder instruction with an unset global reference.
+  AllocGlobalInst(SILDebugLocation *DebugLoc);
+
+  /// Return the referenced global variable.
+  SILGlobalVariable *getReferencedGlobal() const { return Global; }
+  
+  void setReferencedGlobal(SILGlobalVariable *v) { Global = v; }
+
+  ArrayRef<Operand> getAllOperands() const { return {}; }
+  MutableArrayRef<Operand> getAllOperands() { return {}; }
+
+  static bool classof(const ValueBase *V) {
+    return V->getKind() == ValueKind::AllocGlobalInst;
+  }
+};
+
+/// Gives the address of a SIL global variable. Only valid after an
+/// AllocGlobalInst.
+class GlobalAddrInst : public LiteralInst {
+  friend class SILBuilder;
+  
   SILGlobalVariable *Global;
 
   GlobalAddrInst(SILDebugLocation *DebugLoc, SILGlobalVariable *Global);
@@ -1134,14 +1128,11 @@ public:
 
   /// Create a placeholder instruction with an unset global reference.
   GlobalAddrInst(SILDebugLocation *DebugLoc, SILType Ty);
-
+  
   /// Return the referenced global variable.
   SILGlobalVariable *getReferencedGlobal() const { return Global; }
   
   void setReferencedGlobal(SILGlobalVariable *v) { Global = v; }
-
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
 
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
@@ -1153,7 +1144,9 @@ public:
 
 /// IntegerLiteralInst - Encapsulates an integer constant, as defined originally
 /// by an IntegerLiteralExpr.
-class IntegerLiteralInst : public LiteralInst {
+class IntegerLiteralInst final : public LiteralInst,
+    private llvm::TrailingObjects<IntegerLiteralInst, llvm::integerPart> {
+  friend TrailingObjects;
   friend class SILBuilder;
 
   unsigned numBits;
@@ -1171,9 +1164,6 @@ public:
   /// getValue - Return the APInt for the underlying integer literal.
   APInt getValue() const;
 
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
 
@@ -1184,7 +1174,9 @@ public:
 
 /// FloatLiteralInst - Encapsulates a floating point constant, as defined
 /// originally by a FloatLiteralExpr.
-class FloatLiteralInst : public LiteralInst {
+class FloatLiteralInst final : public LiteralInst,
+    private llvm::TrailingObjects<FloatLiteralInst, llvm::integerPart> {
+  friend TrailingObjects;
   friend class SILBuilder;
 
   unsigned numBits;
@@ -1203,9 +1195,6 @@ public:
   /// \brief Return the bitcast representation of the FP literal as an APInt.
   APInt getBits() const;
 
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
 
@@ -1217,13 +1206,17 @@ public:
 /// StringLiteralInst - Encapsulates a string constant, as defined originally by
 /// a StringLiteralExpr.  This produces the address of the string data as a
 /// Builtin.RawPointer.
-class StringLiteralInst : public LiteralInst {
+class StringLiteralInst final : public LiteralInst,
+    private llvm::TrailingObjects<StringLiteralInst, char> {
+  friend TrailingObjects;
   friend class SILBuilder;
 
 public:
   enum class Encoding {
     UTF8,
-    UTF16
+    UTF16,
+    /// UTF-8 encoding of an Objective-C selector.
+    ObjCSelector,
   };
 
 private:
@@ -1239,7 +1232,7 @@ private:
 public:
   /// getValue - Return the string data for the literal, in UTF-8.
   StringRef getValue() const {
-    return {reinterpret_cast<char const *>(this + 1), Length};
+    return {getTrailingObjects<char>(), Length};
   }
 
   /// getEncoding - Return the desired encoding of the text.
@@ -1276,7 +1269,7 @@ class LoadInst
   ///        use for the load.
   LoadInst(SILDebugLocation *DebugLoc, SILValue LValue)
       : UnaryInstructionBase(DebugLoc, LValue,
-                             LValue.getType().getObjectType()) {}
+                             LValue->getType().getObjectType()) {}
 };
 
 /// StoreInst - Represents a store from a memory location.
@@ -1329,7 +1322,7 @@ public:
   SILValue getDest() const { return Operands[Dest].get(); }
 
   bool isUnownedAssign() const {
-    return getDest().getType().getObjectType().is<UnownedStorageType>();
+    return getDest()->getType().getObjectType().is<UnownedStorageType>();
   }
 
   ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
@@ -1371,7 +1364,7 @@ private:
   Kind ThisKind;
 
   MarkUninitializedInst(SILDebugLocation *DebugLoc, SILValue Address, Kind K)
-      : UnaryInstructionBase(DebugLoc, Address, Address.getType()),
+      : UnaryInstructionBase(DebugLoc, Address, Address->getType()),
         ThisKind(K) {}
 
 public:
@@ -1432,7 +1425,10 @@ public:
 
 /// Define the start or update to a symbolic variable value (for loadable
 /// types).
-class DebugValueInst : public UnaryInstructionBase<ValueKind::DebugValueInst> {
+class DebugValueInst final
+  : public UnaryInstructionBase<ValueKind::DebugValueInst>,
+    private llvm::TrailingObjects<DebugValueInst, char> {
+  friend TrailingObjects;
   friend class SILBuilder;
   TailAllocatedDebugVariable VarInfo;
 
@@ -1447,14 +1443,16 @@ public:
   VarDecl *getDecl() const;
   /// Return the debug variable information attached to this instruction.
   SILDebugVariable getVarInfo() const {
-    return VarInfo.get(getDecl(), reinterpret_cast<const char *>(this + 1));
+    return VarInfo.get(getDecl(), getTrailingObjects<char>());
   }
 };
 
 /// Define the start or update to a symbolic variable value (for address-only
 /// types) .
 class DebugValueAddrInst
-  : public UnaryInstructionBase<ValueKind::DebugValueAddrInst> {
+  : public UnaryInstructionBase<ValueKind::DebugValueAddrInst>,
+    private llvm::TrailingObjects<DebugValueInst, char> {
+  friend TrailingObjects;
   friend class SILBuilder;
   TailAllocatedDebugVariable VarInfo;
 
@@ -1470,7 +1468,7 @@ public:
   VarDecl *getDecl() const;
   /// Return the debug variable information attached to this instruction.
   SILDebugVariable getVarInfo() const {
-    return VarInfo.get(getDecl(), reinterpret_cast<const char *>(this + 1));
+    return VarInfo.get(getDecl(), getTrailingObjects<char>());
   };
 };
 
@@ -1488,7 +1486,7 @@ class LoadReferenceInstBase : public UnaryInstructionBase<K> {
 
 protected:
   LoadReferenceInstBase(SILDebugLocation *loc, SILValue lvalue, IsTake_t isTake)
-    : UnaryInstructionBase<K>(loc, lvalue, getResultType(lvalue.getType())),
+    : UnaryInstructionBase<K>(loc, lvalue, getResultType(lvalue->getType())),
       IsTake(unsigned(isTake)) {
   }
 
@@ -1651,9 +1649,6 @@ protected:
       : SILInstruction(Kind, DebugLoc, Ty) {}
 
 public:
-  /// All conversion instructions return a single result.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   /// All conversion instructions take the converted value, whose reference
   /// identity is expected to be preserved through the conversion chain, as their
   /// first operand. Some instructions may take additional operands that do not
@@ -2031,9 +2026,6 @@ public:
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
 
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   static bool classof(const ValueBase *V) {
     return V->getKind() == ValueKind::ObjCProtocolInst;
   }
@@ -2128,9 +2120,6 @@ public:
     return Operands.getDynamicValuesAsArray();
   }
 
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
 
@@ -2170,7 +2159,7 @@ public:
     // For each operand...
     for (unsigned i = 0, e = Ops.size(); i != e; ++i) {
       // If the operand is not trivial...
-      if (!Ops[i].get().getType().isTrivial(Mod)) {
+      if (!Ops[i].get()->getType().isTrivial(Mod)) {
         // And we have not found an Index yet, set index to i and continue.
         if (!Index.hasValue()) {
           Index = i;
@@ -2205,9 +2194,8 @@ public:
 /// manipulate the reference count of their object operand.
 class RefCountingInst : public SILInstruction {
 protected:
-  RefCountingInst(ValueKind Kind, SILDebugLocation *DebugLoc,
-                  SILTypeList *TypeList = 0)
-      : SILInstruction(Kind, DebugLoc, TypeList) {}
+  RefCountingInst(ValueKind Kind, SILDebugLocation *DebugLoc)
+      : SILInstruction(Kind, DebugLoc) {}
 
 public:
   static bool classof(const ValueBase *V) {
@@ -2306,9 +2294,6 @@ public:
     return getElements()[i];
   }
 
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
 
@@ -2330,7 +2315,7 @@ public:
     // For each operand...
     for (unsigned i = 0, e = Ops.size(); i != e; ++i) {
       // If the operand is not trivial...
-      if (!Ops[i].get().getType().isTrivial(Mod)) {
+      if (!Ops[i].get()->getType().isTrivial(Mod)) {
         // And we have not found an Index yet, set index to i and continue.
         if (!Index.hasValue()) {
           Index = i;
@@ -2383,8 +2368,6 @@ public:
       ? OptionalOperand->asArray() : MutableArrayRef<Operand>{};
   }
 
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   static bool classof(const ValueBase *V) {
     return V->getKind() == ValueKind::EnumInst;
   }
@@ -2407,7 +2390,7 @@ public:
   EnumElementDecl *getElement() const { return Element; }
 
   EnumDecl *getEnumDecl() const {
-    auto *E = getOperand().getType().getEnumOrBoundGenericEnum();
+    auto *E = getOperand()->getType().getEnumOrBoundGenericEnum();
     assert(E && "Operand of unchecked_enum_data must be of enum type");
     return E;
   }
@@ -2477,7 +2460,7 @@ public:
   EnumElementDecl *getElement() const { return Element; }
 
   EnumDecl *getEnumDecl() const {
-    auto *E = getOperand().getType().getEnumOrBoundGenericEnum();
+    auto *E = getOperand()->getType().getEnumOrBoundGenericEnum();
     assert(E && "Operand of unchecked_take_enum_data_addr must be of enum"
                 " type");
     return E;
@@ -2532,9 +2515,6 @@ public:
   SILValue getDefaultResult() const {
     return static_cast<const Derived *>(this)->getDefaultResult();
   }
-
-  // getType() is OK because there's only one result.
-  SILType getType() const { return SILInstruction::getType(0); }
 };
 
 /// Common base class for the select_enum and select_enum_addr instructions,
@@ -2698,9 +2678,6 @@ class MetatypeInst : public SILInstruction {
 
 public:
 
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
-
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
 
@@ -2747,7 +2724,7 @@ public:
   unsigned getFieldNo() const { return FieldNo; }
 
   TupleType *getTupleType() const {
-    return getOperand().getType().getSwiftRValueType()->castTo<TupleType>();
+    return getOperand()->getType().getSwiftRValueType()->castTo<TupleType>();
   }
 
   unsigned getNumTupleElts() const {
@@ -2777,7 +2754,7 @@ public:
 
 
   TupleType *getTupleType() const {
-    return getOperand().getType().getSwiftRValueType()->castTo<TupleType>();
+    return getOperand()->getType().getSwiftRValueType()->castTo<TupleType>();
   }
 };
 
@@ -2808,7 +2785,7 @@ public:
   }
 
   StructDecl *getStructDecl() const {
-    auto s = getOperand().getType().getStructOrBoundGenericStruct();
+    auto s = getOperand()->getType().getStructOrBoundGenericStruct();
     assert(s);
     return s;
   }
@@ -2850,7 +2827,7 @@ public:
   }
 
   StructDecl *getStructDecl() const {
-    auto s = getOperand().getType().getStructOrBoundGenericStruct();
+    auto s = getOperand()->getType().getStructOrBoundGenericStruct();
     assert(s);
     return s;
   }
@@ -2884,7 +2861,7 @@ public:
   }
 
   ClassDecl *getClassDecl() const {
-    auto s = getOperand().getType().getClassOrBoundGenericClass();
+    auto s = getOperand()->getType().getClassOrBoundGenericClass();
     assert(s);
     return s;
   }
@@ -2900,9 +2877,6 @@ public:
              SILDeclRef Member, bool Volatile = false)
       : SILInstruction(Kind, DebugLoc, Ty), Member(Member), Volatile(Volatile) {
   }
-
-  /// getType() is ok since this is known to only have one type.
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
 
   SILDeclRef getMember() const { return Member; }
 
@@ -2950,11 +2924,11 @@ class WitnessMethodInst : public MethodInst {
   friend class SILBuilder;
 
   CanType LookupType;
-  ProtocolConformance *Conformance;
+  ProtocolConformanceRef Conformance;
   Optional<FixedOperandList<1>> OptionalOperand;
 
   WitnessMethodInst(SILDebugLocation *DebugLoc, CanType LookupType,
-                    ProtocolConformance *Conformance, SILDeclRef Member,
+                    ProtocolConformanceRef Conformance, SILDeclRef Member,
                     SILType Ty, SILValue OpenedExistential,
                     bool Volatile = false)
       : MethodInst(ValueKind::WitnessMethodInst, DebugLoc, Ty, Member,
@@ -2966,7 +2940,7 @@ class WitnessMethodInst : public MethodInst {
 
   static WitnessMethodInst *
   create(SILDebugLocation *DebugLoc, CanType LookupType,
-         ProtocolConformance *Conformance, SILDeclRef Member, SILType Ty,
+         ProtocolConformanceRef Conformance, SILDeclRef Member, SILType Ty,
          SILFunction *Parent, SILValue OpenedExistential,
          bool Volatile = false);
 
@@ -2977,15 +2951,12 @@ public:
     return getMember().getDecl()->getDeclContext()
              ->isProtocolOrProtocolExtensionContext();
   }
-  ProtocolConformance *getConformance() const { return Conformance; }
+  ProtocolConformanceRef getConformance() const { return Conformance; }
 
   /// Get a representation of the lookup type as a substitution of the
   /// protocol's Self archetype.
   Substitution getSelfSubstitution() const {
-    auto memberDC = getMember().getDecl()->getDeclContext();
-    return Substitution{memberDC->getProtocolSelf()->getArchetype(),
-                        getLookupType(),
-                        Conformance};
+    return Substitution{getLookupType(), Conformance};
   }
 
   bool hasOperand() const { return OptionalOperand.hasValue(); }
@@ -3085,11 +3056,11 @@ class InitExistentialAddrInst
   friend class SILBuilder;
 
   CanType ConcreteType;
-  ArrayRef<ProtocolConformance*> Conformances;
+  ArrayRef<ProtocolConformanceRef> Conformances;
 
   InitExistentialAddrInst(SILDebugLocation *DebugLoc, SILValue Existential,
                           CanType ConcreteType, SILType ConcreteLoweredType,
-                          ArrayRef<ProtocolConformance *> Conformances)
+                          ArrayRef<ProtocolConformanceRef> Conformances)
       : UnaryInstructionBase(DebugLoc, Existential,
                              ConcreteLoweredType.getAddressType()),
         ConcreteType(ConcreteType), Conformances(Conformances) {}
@@ -3097,10 +3068,10 @@ class InitExistentialAddrInst
   static InitExistentialAddrInst *
   create(SILDebugLocation *DebugLoc, SILValue Existential, CanType ConcreteType,
          SILType ConcreteLoweredType,
-         ArrayRef<ProtocolConformance *> Conformances, SILFunction *Parent);
+         ArrayRef<ProtocolConformanceRef> Conformances, SILFunction *Parent);
 
 public:
-  ArrayRef<ProtocolConformance*> getConformances() const {
+  ArrayRef<ProtocolConformanceRef> getConformances() const {
     return Conformances;
   }
   
@@ -3122,25 +3093,25 @@ class InitExistentialRefInst
   friend class SILBuilder;
 
   CanType ConcreteType;
-  ArrayRef<ProtocolConformance*> Conformances;
+  ArrayRef<ProtocolConformanceRef> Conformances;
 
   InitExistentialRefInst(SILDebugLocation *DebugLoc, SILType ExistentialType,
                          CanType FormalConcreteType, SILValue Instance,
-                         ArrayRef<ProtocolConformance *> Conformances)
+                         ArrayRef<ProtocolConformanceRef> Conformances)
       : UnaryInstructionBase(DebugLoc, Instance, ExistentialType),
         ConcreteType(FormalConcreteType), Conformances(Conformances) {}
 
   static InitExistentialRefInst *
   create(SILDebugLocation *DebugLoc, SILType ExistentialType,
          CanType ConcreteType, SILValue Instance,
-         ArrayRef<ProtocolConformance *> Conformances, SILFunction *Parent);
+         ArrayRef<ProtocolConformanceRef> Conformances, SILFunction *Parent);
 
 public:
   CanType getFormalConcreteType() const {
     return ConcreteType;
   }
 
-  ArrayRef<ProtocolConformance*> getConformances() const {
+  ArrayRef<ProtocolConformanceRef> getConformances() const {
     return Conformances;
   }
 };
@@ -3148,23 +3119,24 @@ public:
 /// InitExistentialMetatypeInst - Given a metatype reference and a set
 /// of conformances, creates an existential metatype value referencing
 /// the metatype.
-class InitExistentialMetatypeInst
-  : public UnaryInstructionBase<ValueKind::InitExistentialMetatypeInst>
+class InitExistentialMetatypeInst final
+  : public UnaryInstructionBase<ValueKind::InitExistentialMetatypeInst>,
+    private llvm::TrailingObjects<InitExistentialMetatypeInst,
+                                  ProtocolConformanceRef>
 {
+  friend TrailingObjects;
   friend class SILBuilder;
 
-  /// Pointer to the last of our tail allocated conformances. Null if this
-  /// existential metatype does not have any conformances.
-  NullablePtr<ProtocolConformance *> LastConformance;
+  unsigned NumConformances;
 
   InitExistentialMetatypeInst(SILDebugLocation *DebugLoc,
                               SILType existentialMetatypeType,
                               SILValue metatype,
-                              ArrayRef<ProtocolConformance *> conformances);
+                              ArrayRef<ProtocolConformanceRef> conformances);
 
   static InitExistentialMetatypeInst *
   create(SILDebugLocation *DebugLoc, SILType existentialMetatypeType,
-         SILValue metatype, ArrayRef<ProtocolConformance *> conformances,
+         SILValue metatype, ArrayRef<ProtocolConformanceRef> conformances,
          SILFunction *parent);
 
 public:
@@ -3173,7 +3145,7 @@ public:
   /// this method returns Decoder<T>.
   CanType getFormalErasedObjectType() const {
     CanType exType = getType().getSwiftRValueType();
-    CanType concreteType = getOperand().getType().getSwiftRValueType();
+    CanType concreteType = getOperand()->getType().getSwiftRValueType();
     while (auto exMetatype = dyn_cast<ExistentialMetatypeType>(exType)) {
       exType = exMetatype.getInstanceType();
       concreteType = cast<MetatypeType>(concreteType).getInstanceType();
@@ -3182,7 +3154,7 @@ public:
     return concreteType;
   }
 
-  ArrayRef<ProtocolConformance *> getConformances() const;
+  ArrayRef<ProtocolConformanceRef> getConformances() const;
 };
 
 /// DeinitExistentialAddrInst - Given an address of an existential that has been
@@ -3238,9 +3210,6 @@ public:
 
   ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
-
-  /// getType() is OK since there's only one result.
-  SILType getType() const { return SILInstruction::getType(0); }
 
   static bool classof(const ValueBase *V) {
     return V->getKind() == ValueKind::InitBlockStorageHeaderInst;
@@ -3332,7 +3301,7 @@ class MarkDependenceInst : public SILInstruction {
 
   MarkDependenceInst(SILDebugLocation *DebugLoc, SILValue value, SILValue base)
       : SILInstruction(ValueKind::MarkDependenceInst, DebugLoc,
-                       value.getType()),
+                       value->getType()),
         Operands{this, value, base} {}
 
 public:
@@ -3341,8 +3310,6 @@ public:
 
   ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
-
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
 
   static bool classof(const ValueBase *V) {
     return V->getKind() == ValueKind::MarkDependenceInst;
@@ -3358,7 +3325,7 @@ class CopyBlockInst :
   friend class SILBuilder;
 
   CopyBlockInst(SILDebugLocation *DebugLoc, SILValue operand)
-      : UnaryInstructionBase(DebugLoc, operand, operand.getType()) {}
+      : UnaryInstructionBase(DebugLoc, operand, operand->getType()) {}
 };
 
 /// Given an object reference, return true iff it is non-nil and refers
@@ -3390,9 +3357,8 @@ class IsUniqueOrPinnedInst :
 /// DeallocationInst - An abstract parent class for Dealloc{Stack, Box, Ref}.
 class DeallocationInst : public SILInstruction {
 protected:
-  DeallocationInst(ValueKind Kind, SILDebugLocation *DebugLoc,
-                   SILTypeList *TypeList = nullptr)
-      : SILInstruction(Kind, DebugLoc, TypeList) {}
+  DeallocationInst(ValueKind Kind, SILDebugLocation *DebugLoc)
+      : SILInstruction(Kind, DebugLoc) {}
 
 public:
   static bool classof(const ValueBase *V) {
@@ -3571,6 +3537,20 @@ public:
   SILType getValueType() const { return getType().getObjectType(); }
 };
 
+/// Project out the address of the value in an existential box.
+class ProjectExistentialBoxInst :
+  public UnaryInstructionBase<ValueKind::ProjectExistentialBoxInst,
+                              SILInstruction, /*HasResult*/ true> {
+  friend class SILBuilder;
+  
+  ProjectExistentialBoxInst(SILDebugLocation *DebugLoc, SILType valueType,
+                            SILValue operand)
+      : UnaryInstructionBase(DebugLoc, operand, valueType.getAddressType()) {}
+  
+public:
+  SILType getValueType() const { return getType().getObjectType(); }
+};
+
 //===----------------------------------------------------------------------===//
 // Runtime failure
 //===----------------------------------------------------------------------===//
@@ -3597,7 +3577,7 @@ class IndexingInst : public SILInstruction {
 public:
   IndexingInst(ValueKind Kind, SILDebugLocation *DebugLoc, SILValue Operand,
                SILValue Index)
-      : SILInstruction(Kind, DebugLoc, Operand.getType()),
+      : SILInstruction(Kind, DebugLoc, Operand->getType()),
         Operands{this, Operand, Index} {}
 
   SILValue getBase() const { return Operands[Base].get(); }
@@ -3605,8 +3585,6 @@ public:
 
   ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
-
-  SILType getType(unsigned i = 0) const { return ValueBase::getType(i); }
 
   static bool classof(const ValueBase *V) {
     return V->getKind() >= ValueKind::First_IndexingInst
@@ -3657,7 +3635,6 @@ public:
 //===----------------------------------------------------------------------===//
 
 enum class TermKind {
-  Invalid = 0,
 #define TERMINATOR(Id, Parent, MemBehavior, MayRelease) Id,
 #include "SILNodes.def"
 };
@@ -3667,15 +3644,13 @@ struct ValueKindAsTermKind {
 
   ValueKindAsTermKind(ValueKind V) {
     switch (V) {
-#define TERMINATOR(Id, Parent, MemBehavior, MayRelease)                        \
-  case ValueKind::Id:                                                          \
-    K = TermKind::Id;                                                          \
-    break;
-#define VALUE(Id, Parent)                                                      \
-  case ValueKind::Id:                                                          \
-    K = TermKind::Invalid;                                                     \
-    break;
+#define TERMINATOR(Id, Parent, MemBehavior, MayRelease)                 \
+      case ValueKind::Id:                                               \
+        K = TermKind::Id;                                               \
+        break;
 #include "SILNodes.def"
+    default:
+      llvm_unreachable("Not a terminator kind?!");
     }
   }
 
@@ -3893,7 +3868,13 @@ public:
 
   /// Returns the argument on the cond_br terminator that will be passed to
   /// DestBB in A.
-  SILValue getArgForDestBB(SILBasicBlock *DestBB, SILArgument *A);
+  SILValue getArgForDestBB(const SILBasicBlock *DestBB,
+                           const SILArgument *A) const;
+
+  /// Returns the argument on the cond_br terminator that will be passed as the
+  /// \p Index argument to DestBB.
+  SILValue getArgForDestBB(const SILBasicBlock *DestBB,
+                           unsigned ArgIndex) const;
 
   void swapSuccessors();
 
@@ -3986,6 +3967,8 @@ class SwitchEnumInstBase : public TermInst {
   // - `NumCases + HasDefault` SILSuccessor records, referencing the
   //   destinations for each case, ending with the default destination if
   //   present.
+  // FIXME: This should use llvm::TrailingObjects, but it has subclasses
+  // (which are empty, of course).
 
   EnumElementDecl **getCaseBuf() {
     return reinterpret_cast<EnumElementDecl**>(this + 1);
@@ -4387,7 +4370,7 @@ public:
 
   /// Get the type of the callee without the applied substitutions.
   CanSILFunctionType getOrigCalleeType() const {
-    return getCallee().getType().castTo<SILFunctionType>();
+    return getCallee()->getType().castTo<SILFunctionType>();
   }
 
   /// Get the type of the callee with the applied substitutions.

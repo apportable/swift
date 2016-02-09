@@ -90,10 +90,19 @@ static LazySKDUID RequestEditorFindInterfaceDoc(
     "source.request.editor.find_interface_doc");
 static LazySKDUID RequestBuildSettingsRegister(
     "source.request.buildsettings.register");
+static LazySKDUID RequestModuleGroups(
+    "source.request.module.groups");
 
 static LazySKDUID KindExpr("source.lang.swift.expr");
 static LazySKDUID KindStmt("source.lang.swift.stmt");
 static LazySKDUID KindType("source.lang.swift.type");
+
+static LazySKDUID KindEverything("source.codecompletion.everything");
+static LazySKDUID KindModule("source.codecompletion.module");
+static LazySKDUID KindKeyword("source.codecompletion.keyword");
+static LazySKDUID KindLiteral("source.codecompletion.literal");
+static LazySKDUID KindCustom("source.codecompletion.custom");
+static LazySKDUID KindIdentifier("source.codecompletion.identifier");
 
 static UIdent DiagKindNote("source.diagnostic.severity.note");
 static UIdent DiagKindWarning("source.diagnostic.severity.warning");
@@ -169,7 +178,7 @@ editorOpen(StringRef Name, llvm::MemoryBuffer *Buf, bool EnableSyntaxMap,
 
 static sourcekitd_response_t
 editorOpenInterface(StringRef Name, StringRef ModuleName,
-                    ArrayRef<const char *> Args);
+                    Optional<StringRef> Group, ArrayRef<const char *> Args);
 
 static sourcekitd_response_t
 editorOpenHeaderInterface(StringRef Name, StringRef HeaderName,
@@ -204,6 +213,9 @@ editorFindUSR(StringRef DocumentName, StringRef USR);
 
 static sourcekitd_response_t
 editorFindInterfaceDoc(StringRef ModuleName, ArrayRef<const char *> Args);
+
+static sourcekitd_response_t
+editorFindModuleGroups(StringRef ModuleName, ArrayRef<const char *> Args);
 
 static bool isSemanticEditorDisabled();
 
@@ -392,7 +404,8 @@ void handleRequestImpl(sourcekitd_object_t ReqObj, ResponseReceiver Rec) {
     Optional<StringRef> ModuleName = Req.getString(KeyModuleName);
     if (!ModuleName.hasValue())
       return Rec(createErrorRequestInvalid("missing 'key.modulename'"));
-    return Rec(editorOpenInterface(*Name, *ModuleName, Args));
+    Optional<StringRef> GroupName = Req.getString(KeyGroupName);
+    return Rec(editorOpenInterface(*Name, *ModuleName, GroupName, Args));
   }
 
   if (ReqUID == RequestEditorOpenHeaderInterface) {
@@ -437,6 +450,13 @@ void handleRequestImpl(sourcekitd_object_t ReqObj, ResponseReceiver Rec) {
     if (!ModuleName.hasValue())
       return Rec(createErrorRequestInvalid("missing 'key.modulename'"));
     return Rec(editorFindInterfaceDoc(*ModuleName, Args));
+  }
+
+  if (ReqUID == RequestModuleGroups) {
+    Optional<StringRef> ModuleName = Req.getString(KeyModuleName);
+    if (!ModuleName.hasValue())
+      return Rec(createErrorRequestInvalid("missing 'key.modulename'"));
+    return Rec(editorFindModuleGroups(*ModuleName, Args));
   }
 
   if (ReqUID == RequestCodeCompleteClose) {
@@ -1105,6 +1125,8 @@ static void reportCursorInfo(StringRef Filename,
       Elem.set(KeyAnnotatedDecl, Info.AnnotatedDeclaration);
     if (!Info.ModuleName.empty())
       Elem.set(KeyModuleName, Info.ModuleName);
+    if (!Info.GroupName.empty())
+      Elem.set(KeyGroupName, Info.GroupName);
     if (!Info.ModuleInterfaceName.empty())
       Elem.set(KeyModuleInterfaceName, Info.ModuleInterfaceName);
     if (Info.DeclarationLoc.hasValue()) {
@@ -1306,10 +1328,73 @@ static sourcekitd_response_t codeCompleteOpen(StringRef Name,
   ResponseBuilder RespBuilder;
   SKGroupedCodeCompletionConsumer CCC(RespBuilder);
   std::unique_ptr<SKOptionsDictionary> options;
-  if (optionsDict)
-    options = std::move(llvm::make_unique<SKOptionsDictionary>(*optionsDict));
+  std::vector<FilterRule> filterRules;
+  if (optionsDict) {
+    options = llvm::make_unique<SKOptionsDictionary>(*optionsDict);
+    bool failed = false;
+    optionsDict->dictionaryArrayApply(KeyFilterRules, [&](RequestDict dict) {
+      FilterRule rule;
+      auto kind = dict.getUID(KeyKind);
+      if (kind == KindEverything) {
+        rule.kind = FilterRule::Everything;
+      } else if (kind == KindModule) {
+        rule.kind = FilterRule::Module;
+      } else if (kind == KindKeyword) {
+        rule.kind = FilterRule::Keyword;
+      } else if (kind == KindLiteral) {
+        rule.kind = FilterRule::Literal;
+      } else if (kind == KindCustom) {
+        rule.kind = FilterRule::CustomCompletion;
+      } else if (kind == KindIdentifier) {
+        rule.kind = FilterRule::Identifier;
+      } else {
+        // Warning: unknown
+      }
+
+      int64_t hide;
+      if (dict.getInt64(KeyHide, hide, false)) {
+        failed = true;
+        CCC.failed("filter rule missing required key 'key.hide'");
+        return true;
+      }
+
+      rule.hide = hide;
+
+      switch (rule.kind) {
+      case FilterRule::Everything:
+        break;
+      case FilterRule::Module:
+      case FilterRule::Identifier: {
+        SmallVector<const char *, 8> names;
+        if (dict.getStringArray(KeyNames, names, false)) {
+          failed = true;
+          CCC.failed("filter rule missing required key 'key.names'");
+          return true;
+        }
+        rule.names.assign(names.begin(), names.end());
+        break;
+      }
+      case FilterRule::Keyword:
+      case FilterRule::Literal:
+      case FilterRule::CustomCompletion: {
+        SmallVector<sourcekitd_uid_t, 8> uids;
+        dict.getUIDArray(KeyUIDs, uids, true);
+        for (auto uid : uids)
+          rule.uids.push_back(UIdentFromSKDUID(uid));
+        break;
+      }
+      }
+
+      filterRules.push_back(std::move(rule));
+      return false; // continue
+    });
+
+    if (failed)
+      return CCC.createResponse();
+  }
   LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
-  Lang.codeCompleteOpen(Name, InputBuf, Offset, options.get(), CCC, Args);
+  Lang.codeCompleteOpen(Name, InputBuf, Offset, options.get(), filterRules, CCC,
+                        Args);
   return CCC.createResponse();
 }
 
@@ -1328,7 +1413,7 @@ codeCompleteUpdate(StringRef name, int64_t offset,
   SKGroupedCodeCompletionConsumer CCC(RespBuilder);
   std::unique_ptr<SKOptionsDictionary> options;
   if (optionsDict)
-    options = std::move(llvm::make_unique<SKOptionsDictionary>(*optionsDict));
+    options = llvm::make_unique<SKOptionsDictionary>(*optionsDict);
   LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
   Lang.codeCompleteUpdate(name, offset, options.get(), CCC);
   return CCC.createResponse();
@@ -1532,13 +1617,13 @@ editorOpen(StringRef Name, llvm::MemoryBuffer *Buf, bool EnableSyntaxMap,
 
 static sourcekitd_response_t
 editorOpenInterface(StringRef Name, StringRef ModuleName,
-                    ArrayRef<const char *> Args) {
+                    Optional<StringRef> Group, ArrayRef<const char *> Args) {
   SKEditorConsumer EditC(/*EnableSyntaxMap=*/true,
                          /*EnableStructure=*/true,
                          /*EnableDiagnostics=*/false,
                          /*SyntacticOnly=*/false);
   LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
-  Lang.editorOpenInterface(EditC, Name, ModuleName, Args);
+  Lang.editorOpenInterface(EditC, Name, ModuleName, Group, Args);
   return EditC.createResponse();
 }
 
@@ -1754,7 +1839,7 @@ bool SKEditorConsumer::handleDocumentSubStructureElement(UIdent Kind,
   Node.set(KeyKind, Kind);
   Node.set(KeyOffset, Offset);
   Node.set(KeyLength, Length);
-  return  true;
+  return true;
 }
 
 bool SKEditorConsumer::recordAffectedRange(unsigned Offset, unsigned Length) {
@@ -1890,6 +1975,28 @@ editorFindInterfaceDoc(StringRef ModuleName, ArrayRef<const char *> Args) {
       Resp = RespBuilder.createResponse();
     });
 
+  return Resp;
+}
+
+static sourcekitd_response_t
+editorFindModuleGroups(StringRef ModuleName, ArrayRef<const char *> Args) {
+  ResponseBuilder RespBuilder;
+  sourcekitd_response_t Resp;
+  LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
+  Lang.findModuleGroups(ModuleName, Args,
+                        [&](ArrayRef<StringRef> Groups, StringRef Error) {
+    if (!Error.empty()) {
+      Resp = createErrorRequestFailed(Error.str().c_str());
+      return;
+    }
+    auto Dict = RespBuilder.getDictionary();
+    auto Arr = Dict.setArray(KeyModuleGroups);
+    for (auto G : Groups) {
+      auto Entry = Arr.appendDictionary();
+      Entry.set(KeyGroupName, G);
+    }
+    Resp = RespBuilder.createResponse();
+  });
   return Resp;
 }
 

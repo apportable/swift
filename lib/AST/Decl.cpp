@@ -26,6 +26,7 @@
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Mangle.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/ResilienceExpansion.h"
 #include "swift/AST/TypeLoc.h"
 #include "clang/Lex/MacroInfo.h"
 #include "llvm/ADT/SmallString.h"
@@ -469,11 +470,10 @@ GenericParamList::GenericParamList(SourceLoc LAngleLoc,
   : Brackets(LAngleLoc, RAngleLoc), NumParams(Params.size()),
     WhereLoc(WhereLoc), Requirements(Requirements),
     OuterParameters(nullptr),
-    FirstTrailingWhereArg(Requirements.size()),
-    Builder(nullptr)
+    FirstTrailingWhereArg(Requirements.size())
 {
   std::uninitialized_copy(Params.begin(), Params.end(),
-                          reinterpret_cast<GenericTypeParamDecl **>(this + 1));
+                          getTrailingObjects<GenericTypeParamDecl *>());
 }
 
 GenericParamList *
@@ -481,8 +481,7 @@ GenericParamList::create(ASTContext &Context,
                          SourceLoc LAngleLoc,
                          ArrayRef<GenericTypeParamDecl *> Params,
                          SourceLoc RAngleLoc) {
-  unsigned Size = sizeof(GenericParamList)
-                + sizeof(GenericTypeParamDecl *) * Params.size();
+  unsigned Size = totalSizeToAlloc<GenericTypeParamDecl *>(Params.size());
   void *Mem = Context.Allocate(Size, alignof(GenericParamList));
   return new (Mem) GenericParamList(LAngleLoc, Params, SourceLoc(),
                                     MutableArrayRef<RequirementRepr>(),
@@ -496,8 +495,7 @@ GenericParamList::create(const ASTContext &Context,
                          SourceLoc WhereLoc,
                          MutableArrayRef<RequirementRepr> Requirements,
                          SourceLoc RAngleLoc) {
-  unsigned Size = sizeof(GenericParamList)
-                + sizeof(GenericTypeParamDecl *) * Params.size();
+  unsigned Size = totalSizeToAlloc<GenericTypeParamDecl *>(Params.size());
   void *Mem = Context.Allocate(Size, alignof(GenericParamList));
   return new (Mem) GenericParamList(LAngleLoc, Params,
                                     WhereLoc,
@@ -526,27 +524,6 @@ void GenericParamList::addTrailingWhereClause(
   Requirements = newRequirements;
 }
 
-GenericSignature *
-GenericParamList::getAsCanonicalGenericSignature(
-                            llvm::DenseMap<ArchetypeType *, Type> &archetypeMap,
-                            ASTContext &C) const {
-  SmallVector<GenericTypeParamType *, 4> params;
-  SmallVector<Requirement, 4> requirements;
-  
-  getAsGenericSignatureElements(C, archetypeMap, params, requirements);
-
-  // Canonicalize the types in the signature.
-  for (auto &param : params)
-    param = cast<GenericTypeParamType>(param->getCanonicalType());
-  
-  for (auto &reqt : requirements)
-    reqt = Requirement(reqt.getKind(),
-                       reqt.getFirstType()->getCanonicalType(),
-                       reqt.getSecondType()->getCanonicalType());
-  
-  return GenericSignature::get(params, requirements, /*isKnownCanonical=*/true);
-}
-
 ArrayRef<Substitution>
 GenericParamList::getForwardingSubstitutions(ASTContext &C) {
   SmallVector<Substitution, 4> subs;
@@ -558,146 +535,18 @@ GenericParamList::getForwardingSubstitutions(ASTContext &C) {
   for (auto archetype : getAllNestedArchetypes()) {
     // "Check conformance" on each declared protocol to build a
     // conformance map.
-    SmallVector<ProtocolConformance *, 2> conformances;
+    SmallVector<ProtocolConformanceRef, 2> conformances;
 
-    for (ProtocolDecl *conformsTo : archetype->getConformsTo()) {
-      (void)conformsTo;
-      conformances.push_back(nullptr);
+    for (ProtocolDecl *proto : archetype->getConformsTo()) {
+      conformances.push_back(ProtocolConformanceRef(proto));
     }
 
     // Build an identity mapping with the derived conformances.
     auto replacement = SubstitutedType::get(archetype, archetype, C);
-    subs.push_back({archetype, replacement, C.AllocateCopy(conformances)});
+    subs.push_back({replacement, C.AllocateCopy(conformances)});
   }
 
   return C.AllocateCopy(subs);
-}
-
-// Helper for getAsGenericSignatureElements to remap an archetype in a
-// requirement to a canonical dependent type.
-Type
-ArchetypeType::getAsDependentType(
-                   const llvm::DenseMap<ArchetypeType*, Type> &archetypeMap) {
-  // Map associated archetypes to DependentMemberTypes.
-  if (auto parent = getParent()) {
-    auto assocTy = getAssocType();
-    assert(assocTy);
-    Type base = parent->getAsDependentType(archetypeMap);
-    return DependentMemberType::get(base, assocTy, getASTContext());
-  }
-  // Map primary archetypes to generic type parameters.
-  auto found = archetypeMap.find(this);
-  assert(found != archetypeMap.end()
-         && "did not find generic param for archetype");
-  return found->second;
-}
-
-static Type getAsDependentType(Type t,
-                     const llvm::DenseMap<ArchetypeType*, Type> &archetypeMap) {
-  if (!t->hasArchetype())
-    return t;
-
-  return t.transform([&](Type type) -> Type {
-    if (auto arch = type->getAs<ArchetypeType>())
-      return arch->getAsDependentType(archetypeMap);
-    return type;
-  });
-}
-
-// A helper to recursively collect the generic parameters from the outer levels
-// of a generic parameter list.
-void
-GenericParamList::getAsGenericSignatureElements(ASTContext &C,
-                        llvm::DenseMap<ArchetypeType *, Type> &archetypeMap,
-                        SmallVectorImpl<GenericTypeParamType *> &genericParams,
-                        SmallVectorImpl<Requirement> &requirements) const {
-  // Collect outer generic parameters first.
-  if (OuterParameters) {
-    OuterParameters->getAsGenericSignatureElements(C, archetypeMap,
-                                                   genericParams,
-                                                   requirements);
-  }
-
-  // Collect our parameters.
-  for (auto paramIndex : indices(getParams())) {
-    auto param = getParams()[paramIndex];
-    
-    auto typeParamTy = param->getDeclaredType()->castTo<GenericTypeParamType>();
-
-    // Make sure we didn't visit this param already in the parent.
-    auto found = archetypeMap.find(param->getArchetype());
-    if (found != archetypeMap.end()) {
-      assert(found->second->isEqual(typeParamTy));
-      continue;
-    }
-    
-    // Set up a mapping we can use to remap requirements to dependent types.
-    ArchetypeType *archetype = getPrimaryArchetypes()[paramIndex];
-    archetypeMap[archetype] = typeParamTy;
-
-    genericParams.push_back(typeParamTy);
-    requirements.push_back(Requirement(RequirementKind::WitnessMarker,
-                                       typeParamTy, typeParamTy));
-    
-    // Collect conformance requirements declared on the archetype.
-    if (auto super = archetype->getSuperclass()) {
-      requirements.push_back(Requirement(RequirementKind::Conformance,
-                                         typeParamTy, super));
-    }
-    for (auto proto : archetype->getConformsTo()) {
-      requirements.push_back(Requirement(RequirementKind::Conformance,
-                                       typeParamTy, proto->getDeclaredType()));
-    }
-  }
-  
-  // FIXME: Emit WitnessMarker requirements for associated types in an order
-  // that preserves AllArchetypes order but otherwise makes no sense.
-  for (auto assocTy : getAssociatedArchetypes()) {
-    auto depTy = getAsDependentType(assocTy, archetypeMap);
-    requirements.push_back(Requirement(RequirementKind::WitnessMarker,
-                                       depTy, depTy));
-
-    // Add conformance requirements for this associated archetype.
-    for (const auto &repr : getRequirements()) {
-      // Handle same-type requirements at last.
-      if (repr.getKind() != RequirementKind::Conformance)
-        continue;
-
-      // Primary conformance declarations would have already been gathered as
-      // conformance requirements of the archetype.
-      if (auto arch = repr.getSubject()->getAs<ArchetypeType>())
-        if (!arch->getParent())
-          continue;
-
-      auto depTyOfReqt = getAsDependentType(repr.getSubject(), archetypeMap);
-      if (depTyOfReqt.getPointer() != depTy.getPointer())
-        continue;
-
-      Requirement reqt(RequirementKind::Conformance,
-                       getAsDependentType(repr.getSubject(), archetypeMap),
-                       getAsDependentType(repr.getConstraint(), archetypeMap));
-      requirements.push_back(reqt);
-    }
-  }
-  
-  // Add all of the same-type requirements.
-  if (Builder) {
-    for (auto req : Builder->getSameTypeRequirements()) {
-      auto firstType = req.first->getDependentType(*Builder, false);
-      Type secondType;
-      if (auto concrete = req.second.dyn_cast<Type>())
-        secondType = getAsDependentType(concrete, archetypeMap);
-      else if (auto secondPA =
-               req.second.dyn_cast<ArchetypeBuilder::PotentialArchetype*>())
-        secondType = secondPA->getDependentType(*Builder, false);
-
-      if (firstType->is<ErrorType>() || secondType->is<ErrorType>())
-        continue;
-
-      requirements.push_back(Requirement(RequirementKind::SameType,
-                                         firstType, secondType));
-    }
-  }
 }
 
 /// \brief Add the nested archetypes of the given archetype to the set
@@ -747,16 +596,15 @@ TrailingWhereClause::TrailingWhereClause(
   : WhereLoc(whereLoc),
     NumRequirements(requirements.size())
 {
-  memcpy(getRequirements().data(), requirements.data(),
-         NumRequirements * sizeof(RequirementRepr));
+  std::uninitialized_copy(requirements.begin(), requirements.end(),
+                          getTrailingObjects<RequirementRepr>());
 }
 
 TrailingWhereClause *TrailingWhereClause::create(
                        ASTContext &ctx,
                        SourceLoc whereLoc,
                        ArrayRef<RequirementRepr> requirements) {
-  unsigned size = sizeof(TrailingWhereClause)
-                + requirements.size() * sizeof(RequirementRepr);
+  unsigned size = totalSizeToAlloc<RequirementRepr>(requirements.size());
   void *mem = ctx.Allocate(size, alignof(TrailingWhereClause));
   return new (mem) TrailingWhereClause(whereLoc, requirements);
 }
@@ -770,7 +618,7 @@ ImportDecl *ImportDecl::create(ASTContext &Ctx, DeclContext *DC,
   assert(Kind == ImportKind::Module || Path.size() > 1);
   assert(ClangN.isNull() || ClangN.getAsModule() ||
          isa<clang::ImportDecl>(ClangN.getAsDecl()));
-  size_t Size = sizeof(ImportDecl) + Path.size() * sizeof(AccessPathElement);
+  size_t Size = totalSizeToAlloc<AccessPathElement>(Path.size());
   void *ptr = allocateMemoryForDecl<ImportDecl>(Ctx, Size, !ClangN.isNull());
   auto D = new (ptr) ImportDecl(DC, ImportLoc, Kind, KindLoc, Path);
   if (ClangN)
@@ -784,7 +632,8 @@ ImportDecl::ImportDecl(DeclContext *DC, SourceLoc ImportLoc, ImportKind K,
     NumPathElements(Path.size()) {
   ImportDeclBits.ImportKind = static_cast<unsigned>(K);
   assert(getImportKind() == K && "not enough bits for ImportKind");
-  std::uninitialized_copy(Path.begin(), Path.end(), getPathBuffer());
+  std::uninitialized_copy(Path.begin(), Path.end(),
+                          getTrailingObjects<AccessPathElement>());
 }
 
 ImportKind ImportDecl::getBestImportKind(const ValueDecl *VD) {
@@ -1014,12 +863,22 @@ PatternBindingDecl *
 PatternBindingDecl::create(ASTContext &Ctx, SourceLoc StaticLoc,
                            StaticSpellingKind StaticSpelling,
                            SourceLoc VarLoc,
+                           Pattern *Pat, Expr *E,
+                           DeclContext *Parent) {
+  return create(Ctx, StaticLoc, StaticSpelling, VarLoc,
+                PatternBindingEntry(Pat, E),
+                Parent);
+}
+
+PatternBindingDecl *
+PatternBindingDecl::create(ASTContext &Ctx, SourceLoc StaticLoc,
+                           StaticSpellingKind StaticSpelling,
+                           SourceLoc VarLoc,
                            ArrayRef<PatternBindingEntry> PatternList,
                            DeclContext *Parent) {
-  size_t Size = sizeof(PatternBindingDecl) +
-                PatternList.size() * sizeof(PatternBindingEntry);
+  size_t Size = totalSizeToAlloc<PatternBindingEntry>(PatternList.size());
   void *D = allocateMemoryForDecl<PatternBindingDecl>(Ctx, Size,
-                                                            false);
+                                                      /*ClangNode*/false);
   auto PBD = ::new (D) PatternBindingDecl(StaticLoc, StaticSpelling, VarLoc,
                                           PatternList.size(), Parent);
 
@@ -1029,7 +888,7 @@ PatternBindingDecl::create(ASTContext &Ctx, SourceLoc StaticLoc,
   for (auto pe : PatternList) {
     ++elt;
     auto &newEntry = entries[elt];
-    newEntry = { nullptr, pe.getInit() };
+    newEntry = pe; // This should take care of initializer with flags
     PBD->setPattern(elt, pe.getPattern());
   }
   return PBD;
@@ -1064,6 +923,20 @@ unsigned PatternBindingDecl::getPatternEntryIndexForVarDecl(const VarDecl *VD) c
   return ~0U;
 }
 
+SourceRange PatternBindingEntry::getOrigInitRange() const {
+  auto Init = InitCheckedAndRemoved.getPointer();
+  return Init ? Init->getSourceRange() : SourceRange();
+}
+
+void PatternBindingEntry::setInit(Expr *E) {
+  auto F = InitCheckedAndRemoved.getInt();
+  if (E) {
+    InitCheckedAndRemoved.setInt(F - Flags::Removed);
+    InitCheckedAndRemoved.setPointer(E);
+  } else {
+    InitCheckedAndRemoved.setInt(F | Flags::Removed);
+  }
+}
 
 SourceRange PatternBindingDecl::getSourceRange() const {
   SourceLoc startLoc = getStartLoc();
@@ -1167,10 +1040,24 @@ static bool isPolymorphic(const AbstractStorageDecl *storage) {
   llvm_unreachable("bad DeclKind");
 }
 
+static ResilienceExpansion getResilienceExpansion(const DeclContext *DC) {
+  if (auto *AFD = dyn_cast<AbstractFunctionDecl>(DC))
+    if (AFD->isTransparent() &&
+        AFD->getFormalAccess() == Accessibility::Public)
+      return ResilienceExpansion::Minimal;
+
+  return ResilienceExpansion::Maximal;
+}
+
 /// Determines the access semantics to use in a DeclRefExpr or
 /// MemberRefExpr use of this value in the specified context.
 AccessSemantics
 ValueDecl::getAccessSemanticsFromContext(const DeclContext *UseDC) const {
+  // If we're inside a @_transparent function, use the most conservative
+  // access pattern, since we may be inlined from a different resilience
+  // domain.
+  ResilienceExpansion expansion = getResilienceExpansion(UseDC);
+
   if (auto *var = dyn_cast<AbstractStorageDecl>(this)) {
     // Observing member are accessed directly from within their didSet/willSet
     // specifiers.  This prevents assignments from becoming infinite loops.
@@ -1199,12 +1086,10 @@ ValueDecl::getAccessSemanticsFromContext(const DeclContext *UseDC) const {
       if (isPolymorphic(var))
         return AccessSemantics::Ordinary;
 
-      // If the property is defined in a nominal type which must be accessed
-      // resiliently from the current module, we cannot do direct access.
-      auto VarDC = var->getDeclContext();
-      if (auto *nominal = VarDC->isNominalTypeOrNominalTypeExtensionContext())
-        if (!nominal->hasFixedLayout(UseDC->getParentModule()))
-          return AccessSemantics::Ordinary;
+      // If the property does not have a fixed layout from the given context,
+      // we cannot do direct access.
+      if (!var->hasFixedLayout(UseDC->getParentModule(), expansion))
+        return AccessSemantics::Ordinary;
 
       // We know enough about the property to perform direct access.
       return AccessSemantics::DirectToStorage;
@@ -1278,8 +1163,8 @@ AbstractStorageDecl::getAccessStrategy(AccessSemantics semantics,
 
     case StoredWithTrivialAccessors:
     case AddressedWithTrivialAccessors: {
-        // If the property is defined in a non-final class or a protocol, the
-        // accessors are dynamically dispatched, and we cannot do direct access.
+      // If the property is defined in a non-final class or a protocol, the
+      // accessors are dynamically dispatched, and we cannot do direct access.
       if (isPolymorphic(this))
         return AccessStrategy::DispatchToAccessor;
 
@@ -1287,16 +1172,14 @@ AbstractStorageDecl::getAccessStrategy(AccessSemantics semantics,
       // from some resilience domain, we cannot do direct access.
       //
       // As an optimization, we do want to perform direct accesses of stored
-      // properties of resilient types in the same resilience domain as the
-      // access.
+      // properties declared inside the same resilience domain as the access
+      // context.
       //
       // This is done by using DirectToStorage semantics above, with the
       // understanding that the access semantics are with respect to the
       // resilience domain of the accessor's caller.
-      auto DC = getDeclContext();
-      if (auto *nominal = DC->isNominalTypeOrNominalTypeExtensionContext())
-        if (!nominal->hasFixedLayout())
-          return AccessStrategy::DirectToAccessor;
+      if (!hasFixedLayout())
+        return AccessStrategy::DirectToAccessor;
 
       if (storageKind == StoredWithObservers ||
           storageKind == StoredWithTrivialAccessors) {
@@ -1324,6 +1207,39 @@ AbstractStorageDecl::getAccessStrategy(AccessSemantics semantics,
   }
   llvm_unreachable("bad access semantics");
 }
+
+bool AbstractStorageDecl::hasFixedLayout() const {
+  // Private and internal variables always have a fixed layout.
+  // TODO: internal variables with availability information need to be
+  // resilient, since they can be used from @_transparent functions.
+  if (getFormalAccess() != Accessibility::Public)
+    return true;
+
+  // Check for an explicit @_fixed_layout attribute.
+  if (getAttrs().hasAttribute<FixedLayoutAttr>())
+    return true;
+
+  // If we're in a nominal type, just query the type.
+  auto nominal = getDeclContext()->isNominalTypeOrNominalTypeExtensionContext();
+  if (nominal)
+    return nominal->hasFixedLayout();
+
+  // Must use resilient access patterns.
+  assert(getDeclContext()->isModuleScopeContext());
+  return !getDeclContext()->getParentModule()->isResilienceEnabled();
+}
+
+bool AbstractStorageDecl::hasFixedLayout(ModuleDecl *M,
+                                         ResilienceExpansion expansion) const {
+  switch (expansion) {
+  case ResilienceExpansion::Minimal:
+    return hasFixedLayout();
+  case ResilienceExpansion::Maximal:
+    return hasFixedLayout() || M == getModuleContext();
+  }
+  llvm_unreachable("bad resilience expansion");
+}
+
 
 bool ValueDecl::isDefinition() const {
   switch (getKind()) {
@@ -1746,9 +1662,9 @@ Type ValueDecl::getInterfaceType() const {
     auto proto = cast<ProtocolDecl>(getDeclContext());
     (void)proto->getType(); // make sure we've computed the type.
     // FIXME: the generic parameter types list should never be empty.
-    auto selfTy = proto->getGenericParamTypes().empty()
+    auto selfTy = proto->getInnermostGenericParamTypes().empty()
                     ? proto->getProtocolSelf()->getType()
-                    : proto->getGenericParamTypes().back();
+                    : proto->getInnermostGenericParamTypes().back();
     auto &ctx = getASTContext();
     InterfaceTy = DependentMemberType::get(
                     selfTy,
@@ -1835,26 +1751,30 @@ bool NominalTypeDecl::hasFixedLayout() const {
   if (getAttrs().hasAttribute<FixedLayoutAttr>())
     return true;
 
-  if (hasClangNode()) {
-    // Classes imported from Objective-C *never* have a fixed layout.
-    // IRGen needs to use dynamic ivar layout to ensure that subclasses
-    // of Objective-C classes are resilient against base class size
-    // changes.
-    if (isa<ClassDecl>(this))
-      return false;
-
-    // Structs and enums imported from C *always* have a fixed layout.
-    // We know their size, and pass them as values in SIL and IRGen.
+  // Structs and enums imported from C *always* have a fixed layout.
+  // We know their size, and pass them as values in SIL and IRGen.
+  if (hasClangNode())
     return true;
-  }
 
-  // Objective-C enums always have a fixed layout.
-  if (isa<EnumDecl>(this) && isObjC())
+  // @objc enums and protocols always have a fixed layout.
+  if ((isa<EnumDecl>(this) || isa<ProtocolDecl>(this)) && isObjC())
     return true;
 
   // Otherwise, access via indirect "resilient" interfaces.
-  return false;
+  return !getParentModule()->isResilienceEnabled();
 }
+
+bool NominalTypeDecl::hasFixedLayout(ModuleDecl *M,
+                                     ResilienceExpansion expansion) const {
+  switch (expansion) {
+  case ResilienceExpansion::Minimal:
+    return hasFixedLayout();
+  case ResilienceExpansion::Maximal:
+    return hasFixedLayout() || M == getModuleContext();
+  }
+  llvm_unreachable("bad resilience expansion");
+}
+
 
 /// Provide the set of parameters to a generic type, or null if
 /// this function is not generic.
@@ -2154,6 +2074,11 @@ SourceRange AssociatedTypeDecl::getSourceRange() const {
   return SourceRange(KeywordLoc, endLoc);
 }
 
+void AssociatedTypeDecl::setIsRecursive() {
+  AssociatedTypeDeclBits.Recursive = true;
+  overwriteType(ErrorType::get(this->getASTContext()));
+}
+
 EnumDecl::EnumDecl(SourceLoc EnumLoc,
                      Identifier Name, SourceLoc NameLoc,
                      MutableArrayRef<TypeLoc> Inherited,
@@ -2323,9 +2248,7 @@ static StringRef mangleObjCRuntimeName(const NominalTypeDecl *nominal,
 
     NominalTypeDecl *NTD = const_cast<NominalTypeDecl*>(nominal);
     if (isa<ClassDecl>(nominal)) {
-      mangler.mangleNominalType(NTD,
-                                ResilienceExpansion::Minimal,
-                                Mangle::Mangler::BindGenerics::None);
+      mangler.mangleNominalType(NTD, Mangle::Mangler::BindGenerics::None);
     } else {
       mangler.mangleProtocolDecl(cast<ProtocolDecl>(NTD));
     }
@@ -2823,14 +2746,17 @@ void AbstractStorageDecl::makeComputedWithMutableAddress(SourceLoc lbraceLoc,
   assert(mutableAddressor);
   auto &ctx = getASTContext();
 
-  void *mem = ctx.Allocate(sizeof(GetSetRecordWithAddressors),
-                           alignof(GetSetRecordWithAddressors));
-  auto info = new (mem) GetSetRecordWithAddressors();
+  static_assert(alignof(AddressorRecord) == alignof(GetSetRecord),
+                "inconsistent alignment");
+  void *mem = ctx.Allocate(sizeof(AddressorRecord) + sizeof(GetSetRecord),
+                           alignof(AddressorRecord));
+  auto addressorInfo = new (mem) AddressorRecord();
+  auto info = new (addressorInfo->getGetSet()) GetSetRecord();
   info->Braces = SourceRange(lbraceLoc, rbraceLoc);
   GetSetInfo.setPointer(info);
   setStorageKind(ComputedWithMutableAddress);
 
-  configureAddressorRecord(info, nullptr, mutableAddressor);
+  configureAddressorRecord(addressorInfo, nullptr, mutableAddressor);
   configureGetSetRecord(info, get, set, materializeForSet);
 }
 
@@ -2878,14 +2804,17 @@ void AbstractStorageDecl::makeAddressed(SourceLoc lbraceLoc, FuncDecl *addressor
 
   auto &ctx = getASTContext();
 
-  void *mem = ctx.Allocate(sizeof(GetSetRecordWithAddressors),
-                           alignof(GetSetRecordWithAddressors));
-  auto info = new (mem) GetSetRecordWithAddressors();
+  static_assert(alignof(AddressorRecord) == alignof(GetSetRecord),
+                "inconsistent alignment");
+  void *mem = ctx.Allocate(sizeof(AddressorRecord) + sizeof(GetSetRecord),
+                           alignof(AddressorRecord));
+  auto addressorInfo = new (mem) AddressorRecord();
+  auto info = new (addressorInfo->getGetSet()) GetSetRecord();
   info->Braces = SourceRange(lbraceLoc, rbraceLoc);
   GetSetInfo.setPointer(info);
   setStorageKind(Addressed);
 
-  configureAddressorRecord(info, addressor, mutableAddressor);
+  configureAddressorRecord(addressorInfo, addressor, mutableAddressor);
 }
 
 void AbstractStorageDecl::makeStoredWithObservers(SourceLoc LBraceLoc,
@@ -2940,15 +2869,18 @@ void AbstractStorageDecl::makeAddressedWithObservers(SourceLoc lbraceLoc,
          "Can't be Observing without one or the other");
 
   auto &ctx = getASTContext();
-  void *mem = ctx.Allocate(sizeof(ObservingRecordWithAddressors),
-                           alignof(ObservingRecordWithAddressors));
-  auto info = new (mem) ObservingRecordWithAddressors();
-  info->Braces = SourceRange(lbraceLoc, rbraceLoc);
-  GetSetInfo.setPointer(info);
+  static_assert(alignof(AddressorRecord) == alignof(ObservingRecord),
+                "inconsistent alignment");
+  void *mem = ctx.Allocate(sizeof(AddressorRecord) + sizeof(ObservingRecord),
+                           alignof(AddressorRecord));
+  auto addressorInfo = new (mem) AddressorRecord();
+  auto observerInfo = new (addressorInfo->getGetSet()) ObservingRecord();
+  observerInfo->Braces = SourceRange(lbraceLoc, rbraceLoc);
+  GetSetInfo.setPointer(observerInfo);
   setStorageKind(AddressedWithObservers);
 
-  configureAddressorRecord(info, addressor, mutableAddressor);
-  configureObservingRecord(info, willSet, didSet);
+  configureAddressorRecord(addressorInfo, addressor, mutableAddressor);
+  configureObservingRecord(observerInfo, willSet, didSet);
 }
 
 /// \brief Specify the synthesized get/set functions for a Observing var.
@@ -3152,7 +3084,7 @@ SourceRange VarDecl::getSourceRange() const {
 }
 
 SourceRange VarDecl::getTypeSourceRangeForDiagnostics() const {
-  // For a parameter, map back to it's parameter to get the TypeLoc.
+  // For a parameter, map back to its parameter to get the TypeLoc.
   if (auto *PD = dyn_cast<ParamDecl>(this)) {
     if (auto typeRepr = PD->getTypeLoc().getTypeRepr())
       return typeRepr->getSourceRange();
@@ -3221,7 +3153,10 @@ Pattern *VarDecl::getParentPattern() const {
 }
 
 bool VarDecl::isSelfParameter() const {
-  return isa<ParamDecl>(this) && getName() == getASTContext().Id_self;
+  // Note: we need to check the isImplicit() bit here to make sure that we
+  // don't classify explicit parameters declared with `self` as the self param.
+  return isa<ParamDecl>(this) && getName() == getASTContext().Id_self &&
+         isImplicit();
 }
 
 /// Return true if this stored property needs to be accessed with getters and
@@ -3306,7 +3241,7 @@ void VarDecl::emitLetToVarNoteIfSimple(DeclContext *UseDC) const {
   if (isSelfParameter() && UseDC) {
     // If the problematic decl is 'self', then we might be trying to mutate
     // a property in a non-mutating method.
-    auto FD = dyn_cast<FuncDecl>(UseDC->getInnermostMethodContext());
+    auto FD = dyn_cast_or_null<FuncDecl>(UseDC->getInnermostMethodContext());
     if (FD && !FD->isMutating() && !FD->isImplicit() && FD->isInstanceMember()&&
         !FD->getDeclContext()->getDeclaredTypeInContext()
                  ->hasReferenceSemantics()) {
@@ -3336,12 +3271,14 @@ void VarDecl::emitLetToVarNoteIfSimple(DeclContext *UseDC) const {
   }
 }
 
-ParamDecl::ParamDecl(bool isLet, SourceLoc argumentNameLoc,
+ParamDecl::ParamDecl(bool isLet,
+                     SourceLoc letVarInOutLoc, SourceLoc argumentNameLoc,
                      Identifier argumentName, SourceLoc parameterNameLoc,
                      Identifier parameterName, Type ty, DeclContext *dc)
   : VarDecl(DeclKind::Param, /*IsStatic=*/false, isLet, parameterNameLoc,
             parameterName, ty, dc),
-  ArgumentName(argumentName), ArgumentNameLoc(argumentNameLoc) {
+  ArgumentName(argumentName), ArgumentNameLoc(argumentNameLoc),
+  LetVarInOutLoc(letVarInOutLoc) {
 }
 
 /// Clone constructor, allocates a new ParamDecl identical to the first.
@@ -3352,6 +3289,7 @@ ParamDecl::ParamDecl(ParamDecl *PD)
             PD->getDeclContext()),
     ArgumentName(PD->getArgumentName()),
     ArgumentNameLoc(PD->getArgumentNameLoc()),
+    LetVarInOutLoc(PD->getLetVarInOutLoc()),
     typeLoc(PD->getTypeLoc()),
     DefaultValueAndIsVariadic(PD->DefaultValueAndIsVariadic),
     IsTypeLocImplicit(PD->IsTypeLocImplicit),
@@ -3397,7 +3335,7 @@ ParamDecl *ParamDecl::createSelf(SourceLoc loc, DeclContext *DC,
       selfType = InOutType::get(selfType);
   }
     
-  auto *selfDecl = new (C) ParamDecl(/*IsLet*/!isInOut, SourceLoc(),
+  auto *selfDecl = new (C) ParamDecl(/*IsLet*/!isInOut, SourceLoc(),SourceLoc(),
                                      Identifier(), loc, C.Id_self, selfType,DC);
   selfDecl->setImplicit();
   return selfDecl;
@@ -3431,7 +3369,7 @@ SourceRange ParamDecl::getSourceRange() const {
   // If the typeloc has a valid location, use it to end the range.
   if (auto typeRepr = getTypeLoc().getTypeRepr()) {
     auto endLoc = typeRepr->getEndLoc();
-    if (endLoc.isValid())
+    if (endLoc.isValid() && !isTypeLocImplicit())
       return SourceRange(range.Start, endLoc);
   }
   
@@ -3915,7 +3853,7 @@ FuncDecl *FuncDecl::createImpl(ASTContext &Context,
                                DeclContext *Parent,
                                ClangNode ClangN) {
   assert(NumParamPatterns > 0);
-  size_t Size = sizeof(FuncDecl) + NumParamPatterns * sizeof(Pattern *);
+  size_t Size = totalSizeToAlloc<ParameterList *>(NumParamPatterns);
   void *DeclPtr = allocateMemoryForDecl<FuncDecl>(Context, Size,
                                                   !ClangN.isNull());
   auto D = ::new (DeclPtr)
@@ -4339,10 +4277,13 @@ ConstructorDecl::getDelegatingOrChainedInitKind(DiagnosticEngine *diags,
 
       if (isa<OtherConstructorDeclRefExpr>(Callee)) {
         arg = apply->getArg();
-      } else if (auto *UCE = dyn_cast<UnresolvedConstructorExpr>(Callee)) {
-        arg = UCE->getSubExpr();
       } else if (auto *CRE = dyn_cast<ConstructorRefCallExpr>(Callee)) {
         arg = CRE->getArg();
+      } else if (auto *dotExpr = dyn_cast<UnresolvedDotExpr>(Callee)) {
+        if (dotExpr->getName().getBaseName().str() != "init")
+          return { true, E };
+
+        arg = dotExpr->getBase();
       } else {
         // Not a constructor call.
         return { true, E };

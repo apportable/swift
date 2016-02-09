@@ -37,7 +37,6 @@ namespace swift {
   class SILBuilder;
   class SILLocation;
   class SILModule;
-  class SILValue;
   class ValueDecl;
 
 namespace Lowering {
@@ -361,16 +360,13 @@ protected:
 };
 
 /// Type and lowering information about a constant function.
-SIL_FUNCTION_TYPE_IGNORE_DEPRECATED_BEGIN
 struct SILConstantInfo {
   /// The formal type of the constant, still curried.  For a normal
   /// function, this is just its declared type; for a getter or
   /// setter, computing this can be more involved.
-  CanAnyFunctionType FormalType SIL_FUNCTION_TYPE_DEPRECATED;
   CanAnyFunctionType FormalInterfaceType;
 
   /// The uncurried and bridged type of the constant.
-  CanAnyFunctionType LoweredType SIL_FUNCTION_TYPE_DEPRECATED;
   CanAnyFunctionType LoweredInterfaceType;
 
   /// The SIL function type of the constant.
@@ -397,9 +393,7 @@ struct SILConstantInfo {
   }
 
   friend bool operator==(SILConstantInfo lhs, SILConstantInfo rhs) {
-    return lhs.FormalType == rhs.FormalType &&
-           lhs.FormalInterfaceType == rhs.FormalInterfaceType &&
-           lhs.LoweredType == rhs.LoweredType &&
+    return lhs.FormalInterfaceType == rhs.FormalInterfaceType &&
            lhs.LoweredInterfaceType == rhs.LoweredInterfaceType &&
            lhs.SILFnType == rhs.SILFnType &&
            lhs.ContextGenericParams == rhs.ContextGenericParams &&
@@ -409,7 +403,6 @@ struct SILConstantInfo {
     return !(lhs == rhs);
   }
 };
-SIL_FUNCTION_TYPE_IGNORE_DEPRECATED_END
 
 /// Different ways in which a function can capture context.
 enum class CaptureKind {
@@ -442,13 +435,15 @@ class TypeConverter {
   };
 
   struct CachingTypeKey {
+    GenericSignature *Sig;
     AbstractionPattern::CachingKey OrigType;
     CanType SubstType;
     unsigned UncurryLevel;
 
     friend bool operator==(const CachingTypeKey &lhs,
                            const CachingTypeKey &rhs) {
-      return lhs.OrigType == rhs.OrigType
+      return lhs.Sig == rhs.Sig
+          && lhs.OrigType == rhs.OrigType
           && lhs.SubstType == rhs.SubstType
           && lhs.UncurryLevel == rhs.UncurryLevel;
     }
@@ -471,7 +466,12 @@ class TypeConverter {
 
     CachingTypeKey getCachingKey() const {
       assert(isCacheable());
-      return { OrigType.getCachingKey(), SubstType, UncurryLevel };
+      return { (OrigType.hasGenericSignature()
+                   ? OrigType.getGenericSignature()
+                   : nullptr),
+               OrigType.getCachingKey(),
+               SubstType,
+               UncurryLevel };
     }
 
     bool isCacheable() const {
@@ -480,8 +480,6 @@ class TypeConverter {
     
     IsDependent_t isDependent() const {
       if (SubstType->hasTypeParameter())
-        return IsDependent;
-      if (!OrigType.isOpaque() && OrigType.getType()->hasTypeParameter())
         return IsDependent;
       return IsNotDependent;
     }
@@ -530,16 +528,9 @@ class TypeConverter {
   
   llvm::DenseMap<AnyFunctionRef, CaptureInfo> LoweredCaptures;
   
-  /// The set of recursive types we've already diagnosed.
-  llvm::DenseSet<NominalTypeDecl *> RecursiveNominalTypes;
-  
-  /// ArchetypeBuilder used for lowering types in generic function contexts.
-  Optional<ArchetypeBuilder> GenericArchetypes;
-
   /// The current generic context signature.
   CanGenericSignature CurGenericContext;
   
-  CanAnyFunctionType makeConstantType(SILDeclRef constant);
   CanAnyFunctionType makeConstantInterfaceType(SILDeclRef constant);
   
   /// Get the context parameters for a constant. Returns a pair of the innermost
@@ -617,7 +608,8 @@ public:
   /// Lowers a Swift type to a SILType, and returns the SIL TypeLowering
   /// for that type.
   const TypeLowering &getTypeLowering(Type t, unsigned uncurryLevel = 0) {
-    return getTypeLowering(AbstractionPattern(t), t, uncurryLevel);
+    AbstractionPattern pattern(CurGenericContext, t->getCanonicalType());
+    return getTypeLowering(pattern, t, uncurryLevel);
   }
 
   /// Lowers a Swift type to a SILType according to the abstraction
@@ -671,20 +663,6 @@ public:
     return getConstantInfo(constant).getSILType();
   }
 
-  /// Returns the formal AST type of a constant reference.
-  /// Parameters remain uncurried and unbridged.
-  CanAnyFunctionType getConstantFormalType(SILDeclRef constant)
-  SIL_FUNCTION_TYPE_DEPRECATED {
-    return getConstantInfo(constant).FormalType;
-  }
-
-  /// Returns the lowered AST type of a constant reference.
-  /// Parameters have been uncurried and bridged.
-  CanAnyFunctionType getConstantLoweredType(SILDeclRef constant)
-  SIL_FUNCTION_TYPE_DEPRECATED {
-    return getConstantInfo(constant).LoweredType;
-  }
-
   /// Returns the SILFunctionType for the given declaration.
   CanSILFunctionType getConstantFunctionType(SILDeclRef constant) {
     return getConstantInfo(constant).SILFnType;
@@ -716,7 +694,6 @@ public:
   /// given substituted type.
   CanSILFunctionType substFunctionType(CanSILFunctionType origFnType,
                                  CanAnyFunctionType origLoweredType,
-                                 CanAnyFunctionType substLoweredType,
                                  CanAnyFunctionType substLoweredInterfaceType,
                          const Optional<ForeignErrorConvention> &foreignError);
   
@@ -726,8 +703,6 @@ public:
   }
   
   /// Get a function type curried with its capture context.
-  CanAnyFunctionType getFunctionTypeWithCaptures(CanAnyFunctionType funcType,
-                                                 AnyFunctionRef closure);
   CanAnyFunctionType getFunctionInterfaceTypeWithCaptures(
                                               CanAnyFunctionType funcType,
                                               AnyFunctionRef closure);
@@ -796,22 +771,6 @@ public:
   /// interface to this function. There must be an active generic context.
   void popGenericContext(CanGenericSignature sig);
   
-  /// Return the archetype builder for the current generic context. Fails if no
-  /// generic context has been pushed.
-  ArchetypeBuilder &getArchetypes() {
-    return *GenericArchetypes;
-  }
-  
-  // Map a type involving context archetypes out of its context into a
-  // dependent type.
-  CanType getInterfaceTypeOutOfContext(CanType contextTy,
-                                    DeclContext *context) const;
-  
-  // Map a type involving context archetypes out of its context into a
-  // dependent type.
-  CanType getInterfaceTypeOutOfContext(CanType contextTy,
-                                    GenericParamList *contextParams) const;
-
   /// Known types for bridging.
 #define BRIDGING_KNOWN_TYPE(BridgedModule,BridgedType) \
   CanType get##BridgedType##Type();
@@ -912,17 +871,19 @@ namespace llvm {
 
     // Use the second field because the first field can validly be null.
     static CachingTypeKey getEmptyKey() {
-      return {APCachingKey(), CanTypeInfo::getEmptyKey(), 0};
+      return {nullptr, APCachingKey(), CanTypeInfo::getEmptyKey(), 0};
     }
     static CachingTypeKey getTombstoneKey() {
-      return {APCachingKey(), CanTypeInfo::getTombstoneKey(), 0};
+      return {nullptr, APCachingKey(), CanTypeInfo::getTombstoneKey(), 0};
     }
     static unsigned getHashValue(CachingTypeKey val) {
+      auto hashSig =
+        DenseMapInfo<swift::GenericSignature *>::getHashValue(val.Sig);
       auto hashOrig =
         CachingKeyInfo::getHashValue(val.OrigType);
       auto hashSubst =
         DenseMapInfo<swift::CanType>::getHashValue(val.SubstType);
-      return hash_combine(hashOrig, hashSubst, val.UncurryLevel);
+      return hash_combine(hashSig, hashOrig, hashSubst, val.UncurryLevel);
     }
     static bool isEqual(CachingTypeKey LHS, CachingTypeKey RHS) {
       return LHS == RHS;
