@@ -101,7 +101,7 @@ function(_add_variant_c_compile_link_flags)
   endif()
 
 
-  if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+  if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin" AND NOT "${SWIFT_SDK${CFLAGS_SDK}_DEPLOYMENT_VERSION}" STREQUAL "")
     
     # Check if there's a specific iOS deployment version needed for this invocation
     if("${CFLAGS_SDK}" STREQUAL "IOS" OR "${CFLAGS_SDK}" STREQUAL "IOS_SIMULATOR")

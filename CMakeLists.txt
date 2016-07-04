@@ -720,6 +720,23 @@ elseif("${SWIFT_HOST_VARIANT_SDK}" MATCHES "(OSX|IOS*|TVOS*|WATCHOS*)")
     configure_target_variant(WATCHOS_SIMULATOR-R  "watchOS Release"         WATCHOS_SIMULATOR R "Release")
   endif()
 
+  # Compatible cross-compile SDKS for LINUX: ANDROID (arch always armv7)
+  is_sdk_requested(ANDROID swift_build_android)
+  if("${SWIFT_ANDROID_NDK_PATH}" STREQUAL "")
+    set(swift_can_crosscompile_stdlib_android FALSE)
+  else()
+    set(swift_can_crosscompile_stdlib_android TRUE)
+  endif()
+
+  if(swift_build_android AND ${swift_can_crosscompile_stdlib_android})
+    configure_sdk_unix(ANDROID "Android" "android" "android" "armv7" "armv7-none-linux-androideabi" "${SWIFT_ANDROID_SDK_PATH}")
+    # If we're not building for the host, the cross-compiled target should be the 'primary variant'.
+    if("${swift_build_linux}" STREQUAL "FALSE")
+      set(SWIFT_PRIMARY_VARIANT_SDK_default "ANDROID")
+      set(SWIFT_PRIMARY_VARIANT_ARCH_default "armv7")
+    endif()
+  endif()
+
   # FIXME: guess target variant based on the host.
   # if(SWIFT_HOST_VARIANT MATCHES "^macosx")
   #   set(SWIFT_PRIMARY_VARIANT_GUESS "OSX-R")
